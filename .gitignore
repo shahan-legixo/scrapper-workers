@@ -1,0 +1,24 @@
+.env
+secrets/
+*.pem
+gcs-sa.json
+**/gcs-sa.json
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Scrape output: PDFs, index.json, mainOutput.json, CSVs
+output/
+*.pdf
+*.csv
+
+# Local one-off probes, not part of the worker
+scripts/probe_gcp_perms.py
+
+*.egg-info/
+dist/
+build/
+.DS_Store

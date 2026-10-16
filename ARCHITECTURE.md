@@ -1,6 +1,6 @@
 # Cause List Scrapers: Architecture
 
-This project scrapes daily cause lists from 6 courts, writes a Legixo-shaped `mainOutput.json` per court (`CauseList` documents + `CauseListItem` rows), and upserts into MongoDB collections `CauseList` and `CauseListItem`.
+This project scrapes daily cause lists from 6 courts, writes a Legixo-shaped `mainOutput.json` per court (`CauseList` documents + `CauseListItem` rows), and upserts into MongoDB collections `causeList` and `causelistitem`.
 
 Courts covered: Delhi HC, Bombay HC, Madhya Pradesh HC, Telangana HC, Orissa HC, Supreme Court of India.
 
@@ -454,7 +454,7 @@ flowchart LR
 - Each document is the case plus `_id`, `court`, `date`, and `ingestedAt`.
 - The `_id` is stable, so running the same scrape again updates documents instead of duplicating them.
 - Indexes: `(court, date)`, `(date)`, `(courtName)`.
-- Defaults: `MONGO_URI=mongodb://localhost:27017`, `MONGO_DB=causelists`. Collections are fixed: `CauseList`, `CauseListItem`. Setting `MONGO_URI=` to empty disables sync.
+- Defaults: `MONGO_URI=mongodb://localhost:27017`, `MONGO_DB=causelists`. Collections are fixed: `causeList`, `causelistitem`. Setting `MONGO_URI=` to empty disables sync.
 - Status values returned to the caller: `ok`, `skipped_no_uri`, `skipped_no_file`, `error: <message>`.
 
 ## 8. HTTP API (`server.py`)

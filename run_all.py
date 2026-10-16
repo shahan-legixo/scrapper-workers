@@ -45,36 +45,11 @@ def run_delhi(cause_date: str, output_base: Path, delay: float = 1.0) -> dict[st
     t0 = time.time()
     payload = fetch_cause_list(
         cause_date,
-        delay_seconds=delay,
         on_progress=_progress("Delhi"),
     )
     stem = out_dir / f"causelist-{cause_date}"
     json_path = stem.with_suffix(".json")
-    csv_path = stem.with_suffix(".csv")
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    fields = (
-        "date", "courtName", "courtNo", "court_no", "side", "judge", "list_type",
-        "listingNo", "item_no", "caseNumber", "case_no", "party", "case_title",
-        "advocate", "advocates", "section", "case_stage", "remark", "remarks",
-    )
-    with csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
-        writer.writeheader()
-        for bench in payload["benches"]:
-            for list_name, label in LIST_LABELS:
-                for row in bench["lists"][list_name]:
-                    writer.writerow(
-                        {
-                            "date": row.get("date") or payload["date"],
-                            "courtName": row.get("courtName") or payload.get("courtName"),
-                            "court_no": bench["court_no"],
-                            "side": bench["side"],
-                            "judge": row.get("judge") or bench["judge"],
-                            "list_type": row.get("list_type") or label,
-                            **row,
-                        }
-                    )
 
     from all_causelist.main_output import write_main_output_from_payload
 
@@ -104,7 +79,6 @@ def run_bombay(cause_date: str, output_base: Path, delay: float = 1.0) -> dict[s
     payload = fetch_bombay_cause_list(
         cause_date,
         out_dir,
-        delay_seconds=delay,
         on_progress=_progress("Bombay"),
     )
     main_path = Path(payload.get("output_dir") or out_dir) / "mainOutput.json"

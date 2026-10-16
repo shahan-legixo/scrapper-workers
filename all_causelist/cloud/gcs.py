@@ -2,11 +2,11 @@
 
 Locked layout (all courts)::
 
-    gs://BUCKET/<courtKey>/<hearingDate>/<listType>/<file>.pdf
+    gs://BUCKET/causelist/<courtKey>/<hearingDate>/<listType>/<file>.pdf
 
 Example::
 
-    gs://causelists-pdfs/bmhc/2026-10-12/main/coram-01.pdf
+    gs://legixo-docs-dev/causelist/bmhc/2026-10-12/main/coram-01.pdf
 
 Re-runs overwrite the same object (no timestamp in the path).
 """
@@ -61,7 +61,7 @@ def gcs_object_path(
     source_url: str | None = None,
     filename: str | None = None,
 ) -> str:
-    """Relative object path: courtKey/date/listType/file.pdf"""
+    """Relative object path: causelist/courtKey/date/listType/file.pdf"""
     from all_causelist.all_schemas.schema import (
         normalize_list_type_enum,
         resolve_court_key,
@@ -70,7 +70,7 @@ def gcs_object_path(
     ck = resolve_court_key(court_key)
     lt = normalize_list_type_enum(list_type)
     name = stable_pdf_filename(source_url=source_url, filename=filename)
-    return f"{ck}/{hearing_date}/{lt}/{name}"
+    return f"causelist/{ck}/{hearing_date}/{lt}/{name}"
 
 
 def gcs_uri_for(

@@ -13,6 +13,7 @@ Set MONGO_URI= (empty) to disable sync without removing code.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from datetime import datetime, timezone
@@ -20,9 +21,11 @@ from pathlib import Path
 from typing import Any
 
 from bson import ObjectId
-from pymongo import MongoClient, ReplaceOne, UpdateOne
+from pymongo import MongoClient, UpdateOne
 from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
+
+log = logging.getLogger("causelist.mongo")
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -38,6 +41,7 @@ _DEFAULT_URI = "mongodb://localhost:27017"
 _DEFAULT_DB = "causelists"
 _CAUSE_LIST = "CauseList"
 _CAUSE_LIST_ITEM = "CauseListItem"
+_CASE_ALERT_TRACKING = "CaseAlertTracking"
 
 _client: MongoClient | None = None
 _indexes_ready = False
@@ -94,7 +98,23 @@ def _db():
         docs.create_index([("checksum", 1)])
         docs.create_index([("hearingDate", 1), ("courtLevel", 1), ("listType", 1)])
         items.create_index([("documentId", 1)])
-        items.create_index([("documentId", 1), ("fingerprint", 1)], unique=True)
+        # Contract upsert key (replace legacy documentId+fingerprint unique).
+        try:
+            items.drop_index("documentId_1_fingerprint_1")
+        except Exception:  # noqa: BLE001
+            pass
+        items.create_index(
+            [
+                ("documentId", 1),
+                ("identities.caseType", 1),
+                ("identities.rootCaseNumber", 1),
+                ("identities.caseYear", 1),
+                ("identities.diaryNo", 1),
+                ("listingNo", 1),
+            ],
+            unique=True,
+            name="cause_list_item_identity_key",
+        )
         items.create_index([("cnr", 1), ("hearingDate", 1)])
         items.create_index(
             [
@@ -216,6 +236,170 @@ def _item_set(
     return fields
 
 
+def _item_upsert_filter(item: dict[str, Any], document_id: ObjectId) -> dict[str, Any]:
+    """Contract key: documentId + trio + diaryNo + listingNo (null when missing)."""
+    identities = item.get("identities") or {}
+    return {
+        "documentId": document_id,
+        "identities.caseType": identities.get("caseType"),
+        "identities.rootCaseNumber": identities.get("rootCaseNumber"),
+        "identities.caseYear": identities.get("caseYear"),
+        "identities.diaryNo": identities.get("diaryNo"),
+        "listingNo": item.get("listingNo"),
+    }
+
+
+def find_cause_list_unit(
+    *,
+    source: str,
+    court_key: str,
+    hearing_date: str | datetime,
+    list_type: str,
+    bench_label: str,
+    external_id: str,
+) -> dict[str, Any] | None:
+    """findOne CauseList by unit identity."""
+    db = _db()
+    if db is None:
+        return None
+    hearing = (
+        hearing_date
+        if isinstance(hearing_date, datetime)
+        else _parse_hearing_date(hearing_date)
+    )
+    return db[_CAUSE_LIST].find_one(
+        {
+            "source": source,
+            "courtKey": court_key,
+            "hearingDate": hearing,
+            "listType": list_type,
+            "benchLabel": bench_label or "",
+            "externalId": external_id or "",
+        }
+    )
+
+
+def list_items_for_document(document_id: ObjectId | str) -> list[dict[str, Any]]:
+    """Load CauseListItems for a parent CauseList."""
+    db = _db()
+    if db is None:
+        return []
+    oid = (
+        document_id
+        if isinstance(document_id, ObjectId)
+        else ObjectId(str(document_id))
+    )
+    return list(db[_CAUSE_LIST_ITEM].find({"documentId": oid}))
+
+
+def match_tracking_ids_for_item(
+    item: dict[str, Any],
+    *,
+    court_key: str,
+) -> list[str]:
+    """Query CaseAlertTracking for one item; return tracking ObjectId strings."""
+    db = _db()
+    if db is None:
+        return []
+
+    identities = item.get("identities") or {}
+    case_type = (identities.get("caseType") or "").strip().upper()
+    root = (identities.get("rootCaseNumber") or "").strip()
+    year = (identities.get("caseYear") or "").strip()
+    if not case_type or not root or not year:
+        return []
+
+    query: dict[str, Any] = {
+        "enabled": True,
+        "events.causeList": True,
+        "identities.caseType": case_type,
+        "identities.rootCaseNumber": root,
+        "identities.caseYear": year,
+    }
+    diary = identities.get("diaryNo")
+    if diary not in (None, ""):
+        query["identities.diaryNo"] = str(diary).strip()
+
+    from all_causelist.cloud.court_map import scrape_court_id_from_cnr
+
+    tracking_ids: list[str] = []
+    for row in db[_CASE_ALERT_TRACKING].find(query, {"_id": 1, "cnr": 1}):
+        cnr = row.get("cnr")
+        if cnr:
+            mapped = scrape_court_id_from_cnr(str(cnr))
+            if mapped is not None and mapped != court_key:
+                continue
+        tracking_ids.append(str(row["_id"]))
+    if tracking_ids:
+        fp = str(item.get("fingerprint") or "")[:16]
+        log.info(
+            "tracking MATCH court=%s itemId=%s fp=%s... case=%s/%s/%s tracking_count=%s",
+            court_key,
+            item.get("_id"),
+            fp or "-",
+            case_type,
+            root,
+            year,
+            len(tracking_ids),
+        )
+    return tracking_ids
+
+
+def match_and_notify_items(
+    items: list[dict[str, Any]],
+    *,
+    court_key: str,
+) -> dict[str, Any]:
+    """For each item: match tracking → POST notify. Never raises."""
+    from all_causelist.cloud.notify import post_cause_list_notify
+
+    log.info("notify loop START court=%s items=%s", court_key, len(items))
+    matched_items = 0
+    notify_ok = 0
+    notify_fail = 0
+    notify_skip = 0
+    for item in items:
+        if not item.get("_id"):
+            continue
+        tracking_ids = match_tracking_ids_for_item(item, court_key=court_key)
+        if not tracking_ids:
+            continue
+        matched_items += 1
+        fp = str(item.get("fingerprint") or "")[:16]
+        log.info(
+            "notify POST court=%s itemId=%s fp=%s... trackingIds=%s",
+            court_key,
+            item["_id"],
+            fp or "-",
+            tracking_ids,
+        )
+        result = post_cause_list_notify(
+            item_id=str(item["_id"]),
+            tracking_ids=tracking_ids,
+        )
+        status = result.get("status")
+        if status == "ok":
+            notify_ok += 1
+        elif status in ("skipped_no_url", "skipped_no_tracking"):
+            notify_skip += 1
+            log.info(
+                "notify SKIPPED status=%s itemId=%s",
+                status,
+                item["_id"],
+            )
+        else:
+            notify_fail += 1
+    summary = {
+        "item_count": len(items),
+        "matched_items": matched_items,
+        "notify_ok": notify_ok,
+        "notify_fail": notify_fail,
+        "notify_skip": notify_skip,
+    }
+    log.info("notify loop DONE court=%s %s", court_key, summary)
+    return summary
+
+
 def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
     """Upsert CauseList parents then CauseListItem children. Soft-fails via status."""
     if mongo_uri() is None:
@@ -251,6 +435,7 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
         items_upserted = 0
         items_modified = 0
         items_matched = 0
+        items_skipped_no_fp = 0
         item_ops: list[UpdateOne] = []
 
         for doc in documents:
@@ -259,6 +444,14 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
             hearing = _parse_hearing_date(doc.get("hearingDate") or hearing_raw)
             filt = _parent_filter(doc, hearing)
             fields = _parent_set(doc, hearing, now)
+            checksum = doc.get("checksum")
+            log.info(
+                "upsert CauseList court=%s externalId=%s checksum=%s... items=%s",
+                doc.get("courtKey") or court_key,
+                doc.get("externalId") or "-",
+                (str(checksum)[:16] + "...") if checksum else "-",
+                len(doc.get("items") or []),
+            )
             res = docs_coll.update_one(
                 filt,
                 {"$set": fields, "$setOnInsert": {"createdAt": now}},
@@ -277,14 +470,12 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
 
             for item in doc.get("items") or []:
                 if not isinstance(item, dict) or not item.get("fingerprint"):
+                    items_skipped_no_fp += 1
                     continue
                 item_fields = _item_set(item, document_id, hearing, now)
                 item_ops.append(
                     UpdateOne(
-                        {
-                            "documentId": document_id,
-                            "fingerprint": item["fingerprint"],
-                        },
+                        _item_upsert_filter(item, document_id),
                         {
                             "$set": item_fields,
                             "$setOnInsert": {"createdAt": now},
@@ -292,6 +483,13 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                         upsert=True,
                     )
                 )
+
+        if items_skipped_no_fp:
+            log.warning(
+                "upsert skipped %s items without fingerprint court=%s",
+                items_skipped_no_fp,
+                court_key,
+            )
 
         if item_ops:
             # Chunk bulk writes to avoid huge payloads.
@@ -301,8 +499,24 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 items_upserted += bulk.upserted_count
                 items_modified += bulk.modified_count
                 items_matched += bulk.matched_count
+            sample_fps = []
+            for doc in documents:
+                for item in doc.get("items") or []:
+                    if isinstance(item, dict) and item.get("fingerprint"):
+                        sample_fps.append(str(item["fingerprint"])[:16])
+                    if len(sample_fps) >= 3:
+                        break
+                if len(sample_fps) >= 3:
+                    break
+            log.info(
+                "upsert CauseListItem ops=%s upserted=%s modified=%s sample_fp=%s",
+                len(item_ops),
+                items_upserted,
+                items_modified,
+                sample_fps or "-",
+            )
 
-        return _result(
+        result = _result(
             "ok",
             upserted=docs_upserted + items_upserted,
             modified=docs_modified + items_modified,
@@ -323,6 +537,9 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(d, dict)
             ),
         )
+        log.info("upsert DONE court=%s %s", court_key, result)
+        return result
     except (PyMongoError, ValueError, KeyError) as exc:
         reset_client()
+        log.warning("upsert FAILED court=%s error=%s", court_key, exc)
         return _result(f"error: {exc}")

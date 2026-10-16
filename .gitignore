@@ -17,6 +17,7 @@ output/
 
 # Local one-off probes, not part of the worker
 scripts/probe_gcp_perms.py
+scripts/_*.py
 
 *.egg-info/
 dist/

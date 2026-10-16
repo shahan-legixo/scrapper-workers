@@ -243,22 +243,6 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/debug/cloud-config")
-def debug_cloud_config() -> dict[str, Any]:
-    """Local debug: which queues/URLs this worker process is using."""
-    return {
-        "scrape_queue": cloud_config.scrape_queue_name(),
-        "parse_queue": cloud_config.parse_queue_name(),
-        "scraper_url": cloud_config.scraper_service_url(),
-        "parser_url": cloud_config.parser_service_url(),
-        "dry_run": cloud_config.cloud_dry_run(),
-        "project": cloud_config.gcp_project_id(),
-        "location": cloud_config.gcp_location(),
-        "env_PARSE_QUEUE": __import__("os").environ.get("PARSE_QUEUE"),
-        "env_SCRAPE_QUEUE": __import__("os").environ.get("SCRAPE_QUEUE"),
-    }
-
-
 @app.get("/courts")
 def list_courts() -> dict[str, Any]:
     """List court codes and which scraper they trigger."""
@@ -279,6 +263,7 @@ def list_courts() -> dict[str, Any]:
     return {"courts": courts}
 
 
+#asyncrous testing
 @app.post("/scrape", response_model=ScrapeResponse)
 def scrape(body: ScrapeRequest) -> ScrapeResponse:
     """Route by court code, run that scraper, return mainOutput.json path."""
@@ -290,7 +275,7 @@ def scrape(body: ScrapeRequest) -> ScrapeResponse:
     OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
     try:
-        result = runner(cause_date, OUTPUT_BASE, delay=body.delay)
+        result = runner(cause_date, OUTPUT_BASE)
     except Exception as exc:  # noqa: BLE001 â€” surface scraper errors to client
         raise HTTPException(
             status_code=502,
@@ -323,32 +308,6 @@ def scrape(body: ScrapeRequest) -> ScrapeResponse:
     )
 
 
-@app.get("/main-output/{court}")
-def get_main_output(court: str, cause_date: str | None = None) -> dict[str, Any]:
-    """Read existing mainOutput.json for a court without re-scraping."""
-    _, canonical, court_name, _ = resolve_route(court)
-    day = cause_date or date.today().isoformat()
-    if cause_date and not _DATE_RE.match(cause_date):
-        raise HTTPException(status_code=400, detail="cause_date must be YYYY-MM-DD")
-    path = main_output_path(canonical, day)
-    doc = load_main_output(path)
-    if doc is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No mainOutput.json for {court_name} on {day} at {path}",
-        )
-    return {
-        "court": canonical,
-        "courtName": court_name,
-        "courtKey": doc.get("courtKey"),
-        "date": day,
-        "main_output": str(path),
-        "document_count": doc.get("document_count"),
-        "item_count": doc.get("item_count") or doc.get("case_count"),
-        "case_count": doc.get("item_count") or doc.get("case_count"),
-        "data": doc,
-    }
-
 
 def _validated_day(value: str | None) -> str:
     day = value or date.today().isoformat()
@@ -357,25 +316,26 @@ def _validated_day(value: str | None) -> str:
     return day
 
 
-@app.post("/jobs")
-def enqueue_job(body: EnqueueJobRequest) -> dict[str, Any]:
-    """Backend producer: enqueue a scrape Cloud Task for court + date.
+# #send tasks to cloud tasks
+# @app.post("/jobs")
+# def enqueue_job(body: EnqueueJobRequest) -> dict[str, Any]:
+#     """Backend producer: enqueue a scrape Cloud Task for court + date.
 
-    Does not scrape locally. Worker 1 will pick up ``POST /tasks/scrape``.
-    With ``CLOUD_DRY_RUN=true`` the task is only simulated.
-    """
-    day = _validated_day(body.date)
-    code, canonical, court_name, _ = resolve_route(body.court)
-    job = ensure_job(court=code, date=day, status="QUEUED")
-    task = enqueue_scrape_job(court=code, date=day)
-    return {
-        "court_code": code,
-        "court": canonical,
-        "courtName": court_name,
-        "date": day,
-        "job": job,
-        "task": task,
-    }
+#     Does not scrape locally. Worker 1 will pick up ``POST /tasks/scrape``.
+#     With ``CLOUD_DRY_RUN=true`` the task is only simulated.
+#     """
+#     day = _validated_day(body.date)
+#     code, canonical, court_name, _ = resolve_route(body.court)
+#     job = ensure_job(court=code, date=day, status="QUEUED")
+#     task = enqueue_scrape_job(court=code, date=day)
+#     return {
+#         "court_code": code,
+#         "court": canonical,
+#         "courtName": court_name,
+#         "date": day,
+#         "job": job,
+#         "task": task,
+#     }
 
 
 @app.post("/tasks/scrape")
@@ -392,7 +352,7 @@ def tasks_scrape(request: Request, body: ScrapeTaskRequest) -> dict[str, Any]:
         request.client.host if request.client else "-",
     )
     try:
-        result = handle_scrape(court=code, date=day, delay=body.delay)
+        result = handle_scrape(court=code, date=day)
         log.info("HTTP /tasks/scrape OK court=%s status=%s", code, result.get("status"))
         return result
     except Exception as exc:  # noqa: BLE001

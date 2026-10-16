@@ -78,10 +78,14 @@ def _enqueue(
         full_url,
         project,
     )
+    headers = {"Content-Type": "application/json"}
+    # ngrok free browser interstitial blocks bare POSTs from Cloud Tasks.
+    if "ngrok" in worker_url.lower() or "ngrok" in full_url.lower():
+        headers["ngrok-skip-browser-warning"] = "1"
     http_request: dict[str, Any] = {
         "http_method": tasks_v2.HttpMethod.POST,
         "url": full_url,
-        "headers": {"Content-Type": "application/json"},
+        "headers": headers,
         "body": json.dumps(body).encode("utf-8"),
     }
     invoker = config.tasks_invoker_sa()

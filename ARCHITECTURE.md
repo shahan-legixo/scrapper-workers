@@ -44,10 +44,10 @@ In words:
 GCS PDF layout (all courts, folder-wise):
 
 ```text
-gs://BUCKET/<courtKey>/<hearingDate>/<listType>/<file>.pdf
+gs://BUCKET/causelist/<courtKey>/<hearingDate>/<listType>/<file>.pdf
 ```
 
-Example: `gs://causelists-pdfs/bmhc/2026-10-12/main/coram-01.pdf`
+Example: `gs://legixo-docs-dev/causelist/bmhc/2026-10-12/main/coram-01.pdf`
 
 ## 2. Folder structure
 
@@ -77,8 +77,6 @@ causelists/
       supreme_pdf_layout.py PyMuPDF column parser for Supreme Court
   output/                   All generated data (single output location)
 ```
-
-The old Supreme Court CLI is kept as `python -m all_causelist.supreme_cause_list`.
 
 ## 3. How each court is scraped
 

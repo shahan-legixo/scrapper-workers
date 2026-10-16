@@ -499,18 +499,36 @@ def compute_checksum(raw: bytes | str | Any) -> str:
     return sha256_hex(raw)
 
 
+def make_external_id(
+    court_key: str,
+    hearing_date: str,
+    list_type: str,
+    bench_label: str = "",
+) -> str:
+    """Stable CauseList.externalId: ``courtKey:YYYY-MM-DD:listType:benchLabel``."""
+    ck = resolve_court_key(court_key)
+    date = str(hearing_date or "").strip()
+    if hasattr(hearing_date, "strftime"):
+        date = hearing_date.strftime("%Y-%m-%d")  # type: ignore[union-attr]
+    elif len(date) >= 10 and date[4] == "-" and date[7] == "-":
+        date = date[:10]
+    lt = normalize_list_type_enum(list_type)
+    bench = (bench_label or "").strip()
+    return f"{ck}:{date}:{lt}:{bench}"
+
+
 def compute_fingerprint(
     *,
     identities: dict[str, Any],
     hearing_date: str,
     listing_no: int | None,
     listing_section: str | None,
+    purpose: str | None,
     court_no: str | None,
     bench: str | None,
     judges: list[str],
-    party: str | None,
 ) -> str:
-    """Item fingerprint matching Legixo material-hash idea."""
+    """Item fingerprint per HC/SC contract (purpose in, party out)."""
     return sha256_hex(
         [
             identities.get("caseType"),
@@ -520,10 +538,10 @@ def compute_fingerprint(
             hearing_date,
             listing_no,
             listing_section,
+            purpose,
             court_no,
             bench,
             judges,
-            party,
         ]
     )
 
@@ -576,6 +594,7 @@ def make_cause_list_item(
     judges: Any = None,
     listing_no: Any = None,
     listing_section: str | None = None,
+    purpose: str | None = None,
     court_no: str | None = None,
     bench: str | None = None,
     cnr: str | None = None,
@@ -595,6 +614,7 @@ def make_cause_list_item(
     )
     judge_list = as_judge_list(judges)
     section = (listing_section or "").strip() or None
+    purpose_text = (purpose or "").strip() or None
     court = str(court_no).strip() if court_no not in (None, "") else None
     bench_label = (bench or "").strip() or None
     party_text = (party or "").strip() or None
@@ -610,10 +630,10 @@ def make_cause_list_item(
         hearing_date=hearing_date,
         listing_no=listing,
         listing_section=section,
+        purpose=purpose_text,
         court_no=court,
         bench=bench_label,
         judges=judge_list,
-        party=party_text,
     )
     payload: dict[str, Any] = {}
     if court_name_value:
@@ -646,6 +666,8 @@ def make_cause_list_item(
         item["listingNo"] = listing
     if section:
         item["listingSection"] = section
+    if purpose_text:
+        item["purpose"] = purpose_text
     if court:
         item["courtNo"] = court
     if bench_label:
@@ -723,6 +745,9 @@ def flat_case_to_item(
         "cnr",
         "diaryNo",
         "diary_no",
+        "purpose",
+        "case_stage",
+        "listingSection",
         "source_url",
         "pdf_path",
         "pdf_url",
@@ -747,6 +772,7 @@ def flat_case_to_item(
         judges=row.get("judges") or row.get("judge"),
         listing_no=row.get("listingNo"),
         listing_section=row.get("section") or row.get("listingSection"),
+        purpose=row.get("purpose") or row.get("case_stage"),
         court_no=row.get("courtNo"),
         bench=bench or None,
         cnr=row.get("cnr"),
@@ -802,19 +828,15 @@ def group_flat_cases_to_documents(
             or row.get("pdf_url")
             or ""
         )
-        external_id = (
-            group.get("externalId")
-            or row.get("_externalId")
-            or source_url
-            or f"{ck}:{hearing_date}:{list_type}:{bench}"
-        )
-        key = (list_type, bench, str(external_id))
+        # Contract identity — never use download URL / GCS URI as externalId.
+        external_id = make_external_id(ck, hearing_date, list_type, bench)
+        key = (list_type, bench, external_id)
         groups.setdefault(key, []).append(row)
         meta[key] = {
             "list_type_display": display,
             "listType": list_type,
             "benchLabel": bench,
-            "externalId": str(external_id),
+            "externalId": external_id,
             "source_url": source_url or None,
             "rawRef": group.get("rawRef") or row.get("gcs_uri") or row.get("rawRef"),
             "contentType": group.get("contentType") or row.get("contentType"),

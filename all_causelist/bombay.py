@@ -45,7 +45,6 @@ def fetch_bombay_cause_list(
     *,
     coram_filter: str | None = None,
     all_types: bool = False,
-    delay_seconds: float = 1.0,
     parse_pdfs: bool = True,
     on_progress: Callable[[str], None] | None = None,
 ) -> dict:
@@ -97,9 +96,6 @@ def fetch_bombay_cause_list(
 
             pdf_items: list[dict] = []
             for link in links:
-                download_index += 1
-                if download_index > 1 and delay_seconds > 0:
-                    time.sleep(delay_seconds)
                 progress(f"  -> {link['list_type']}")
                 pdf_items.append(
                     _download_pdf(
@@ -205,7 +201,6 @@ def download_bombay_pdfs(
     cause_date: str,
     output_dir: Path,
     *,
-    delay_seconds: float = 1.0,
     coram_filter: str | None = None,
     all_types: bool = False,
     on_progress: Callable[[str], None] | None = None,
@@ -216,7 +211,6 @@ def download_bombay_pdfs(
         output_dir,
         coram_filter=coram_filter,
         all_types=all_types,
-        delay_seconds=delay_seconds,
         parse_pdfs=False,
         on_progress=on_progress,
     )

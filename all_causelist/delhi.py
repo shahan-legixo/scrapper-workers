@@ -56,7 +56,6 @@ def fetch_cause_list(
     cause_date: str,
     *,
     bench_filter: str | None = None,
-    delay_seconds: float = 1.0,
     fetch_cnr: bool = False,
     on_progress: Callable[[str], None] | None = None,
 ) -> dict:
@@ -100,8 +99,6 @@ def fetch_cause_list(
 
         results: list[dict] = []
         for index, bench in enumerate(selected, start=1):
-            if index > 1 and delay_seconds > 0:
-                time.sleep(delay_seconds)
             progress(f"[{index}/{len(selected)}] {bench['judge']}")
             parsed, token = _fetch_bench_details(
                 client,

@@ -35,7 +35,7 @@ def _progress(court: str) -> ProgressFn:
     return lambda msg: print(f"  [{court}] {msg}", flush=True)
 
 
-def run_delhi(cause_date: str, output_base: Path, delay: float = 1.0) -> dict[str, Any]:
+def run_delhi(cause_date: str, output_base: Path) -> dict[str, Any]:
     import csv
 
     from all_causelist.delhi import LIST_LABELS, fetch_cause_list
@@ -52,7 +52,9 @@ def run_delhi(cause_date: str, output_base: Path, delay: float = 1.0) -> dict[st
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     from all_causelist.main_output import write_main_output_from_payload
+  
 
+    #create main file ->will delete later
     main_path = write_main_output_from_payload(
         out_dir,
         "delhi",

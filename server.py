@@ -342,7 +342,7 @@ def _validated_day(value: str | None) -> str:
 def tasks_scrape(request: Request, body: ScrapeTaskRequest) -> dict[str, Any]:
     """Worker 1 — Cloud Tasks target for scrape-jobs queue."""
     day = _validated_day(body.date)
-    code, _, _, _ = resolve_route(body.court)
+    code, _, _, _ = resolve_route(body.court)  
     auth = request.headers.get("authorization") or ""
     log.info(
         "HTTP POST /tasks/scrape court=%s date=%s oidc=%s client=%s",

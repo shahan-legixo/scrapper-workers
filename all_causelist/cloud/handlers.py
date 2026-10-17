@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -44,6 +45,34 @@ log = logging.getLogger("causelist.worker")
 
 PDF_COURTS = frozenset({"bmhc", "orhc", "sci"})
 HTML_COURTS = frozenset({"dlhc", "mphc", "tshc"})
+
+
+def _should_cleanup_local_output() -> bool:
+    """Cloud Run / real cloud: drop local scrape artifacts after GCS (or HTML upsert)."""
+    return not config.cloud_dry_run()
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        if path.is_file():
+            path.unlink()
+            log.info("local output DELETED file=%s", path)
+    except OSError as exc:
+        log.warning("local output delete failed file=%s error=%s", path, exc)
+
+
+def _safe_rmtree(path: Path | str | None) -> None:
+    if not path:
+        return
+    target = Path(path)
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+            log.info("local output DELETED dir=%s", target)
+        elif target.is_file():
+            _safe_unlink(target)
+    except OSError as exc:
+        log.warning("local output rmtree failed path=%s error=%s", target, exc)
 
 
 def handle_scrape(*, court: str, date: str) -> dict[str, Any]:
@@ -99,6 +128,7 @@ def handle_scrape(*, court: str, date: str) -> dict[str, Any]:
         raise
 
 
+#make func parse pdf. for routing also
 def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
     """Worker 2: download PDF (or use local_path), parse, upsert CauseList + items."""
     court_key = resolve_court_key(str(body.get("court") or ""))
@@ -435,6 +465,9 @@ def _scrape_pdf_court(
                 }
             )
             enqueued.append({"status": "inline_parsed", "result": parsed})
+            # Inline parse done — local PDF no longer needed on cloud.
+            if _should_cleanup_local_output():
+                _safe_unlink(Path(item["pdf_path"]))
         else:
             from all_causelist.cloud.tasks import enqueue_parse_job
 
@@ -451,6 +484,12 @@ def _scrape_pdf_court(
             )
             log.info("pdf parse task result=%s", task.get("status") or task)
             enqueued.append(task)
+            # Cloud Tasks parse uses gcs_uri only — drop local scrape copy.
+            if _should_cleanup_local_output() and up.get("gcs_uri"):
+                _safe_unlink(Path(item["pdf_path"]))
+
+    if _should_cleanup_local_output():
+        _safe_rmtree(payload.get("output_dir"))
 
     return {
         "status": "ok",
@@ -462,6 +501,7 @@ def _scrape_pdf_court(
         "uploads": uploads,
         "parse_tasks": enqueued,
         "output_dir": payload.get("output_dir"),
+        "local_output_cleaned": _should_cleanup_local_output(),
     }
 
 
@@ -469,7 +509,6 @@ def _scrape_html_court(
     *,
     court_key: str,
     date: str,
-    delay: float,
     output_base: Path,
 ) -> dict[str, Any]:
     from run_all import (
@@ -534,10 +573,20 @@ def _scrape_html_court(
         item_count = int(result.get("case_count") or 0)
 
     # HTML: no PDFs — mark complete via parsing with total 0 / or complete status
-    mark_parsing(court=court_key, date=date, pdf_total=0)
+    mark_parsing(court=court_key, date=date, pdf_total=0) 
     from all_causelist.cloud.jobs import set_job_status, STATUS_COMPLETE
 
     set_job_status(court=court_key, date=date, status=STATUS_COMPLETE)
+
+    cleaned = False
+    if _should_cleanup_local_output() and main_path.is_file():
+        day_dir = main_path.parent
+        # Prefer deleting causelist-<date>/; else just the JSON file.
+        if day_dir.name.startswith("causelist-"):
+            _safe_rmtree(day_dir)
+        else:
+            _safe_unlink(main_path)
+        cleaned = True
 
     return {
         "status": "ok",
@@ -548,6 +597,7 @@ def _scrape_html_court(
         "main_output": str(main_path) if main_path.is_file() else None,
         "mongodb": mongo,
         "notify": notify,
+        "local_output_cleaned": cleaned,
         "runner": {k: v for k, v in result.items() if k != "payload"},
     }
 

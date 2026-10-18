@@ -1,6 +1,6 @@
 """Legixo-aligned cause-list schema: CauseList (parent) + CauseListItem (child).
 
-Canonical Mongo collections: ``causeList``, ``causelistitem``.
+Canonical Mongo collections: ``causelists``, ``causelistsitems``.
 PDF URI lives on the parent as ``rawRef`` only.
 """
 

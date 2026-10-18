@@ -22,7 +22,7 @@ POST /tasks/scrape  (cloud / contract path)
        checksum gate → parse PDF → upsert → match → notify
 ```
 
-**Collections:** `causeList` (one board unit), `causelistitem` (one listing row).  
+**Collections:** `causelists` (one board unit), `causelistsitems` (one listing row).  
 **GCS layout:** `gs://BUCKET/causelist/<courtKey>/<date>/<listType>/<file>.pdf`  
 **Notify body:** `{ "itemId", "trackingIds" }` → `CAUSE_LIST_NOTIFY_URL`
 

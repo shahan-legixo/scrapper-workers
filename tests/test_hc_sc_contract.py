@@ -349,5 +349,40 @@ class StoreRematchFlowTests(unittest.TestCase):
         self.assertEqual(result["mongodb"]["status"], "checksum_unchanged")
 
 
+class MongoCollectionNamesTests(unittest.TestCase):
+    def test_collection_names_default(self) -> None:
+        import db.mongo as mongo
+        self.assertEqual(mongo.mongo_collection_name(), "causelists")
+        self.assertEqual(mongo._CAUSE_LIST, "causelists")
+        self.assertEqual(mongo._CAUSE_LIST_ITEM, "causelistsitems")
+        result = mongo._result("ok")
+        self.assertEqual(result["collection"], "causelists+causelistsitems")
+
+    def test_find_cause_list_unit_targets_causelists_collection(self) -> None:
+        import db.mongo as mongo
+        mock_db = MagicMock()
+        with patch("db.mongo._db", return_value=mock_db):
+            mongo.find_cause_list_unit(
+                source="test",
+                court_key="dlhc",
+                hearing_date="2026-10-14",
+                list_type="main",
+                bench_label="BENCH",
+                external_id="ext-1",
+            )
+        mock_db.__getitem__.assert_called_with("causelists")
+
+    def test_list_items_targets_causelistsitems_collection(self) -> None:
+        import db.mongo as mongo
+        mock_db = MagicMock()
+        mock_coll = MagicMock()
+        mock_coll.find.return_value = []
+        mock_db.__getitem__.return_value = mock_coll
+        with patch("db.mongo._db", return_value=mock_db):
+            mongo.list_items_for_document(ObjectId())
+        mock_db.__getitem__.assert_called_with("causelistsitems")
+
+
 if __name__ == "__main__":
     unittest.main()
+

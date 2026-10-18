@@ -46,6 +46,44 @@ log = logging.getLogger("causelist.worker")
 PDF_COURTS = frozenset({"bmhc", "orhc", "sci"})
 HTML_COURTS = frozenset({"dlhc", "mphc", "tshc"})
 
+# Court portals raise these when the date has no list yet — not a worker failure.
+_NOT_PUBLISHED_MARKERS = (
+    "no sci glance pdfs published",
+    "no cause list published",
+    "no bombay cause list",
+    "empty coram table",
+    "could not parse coram rows",
+    "could not parse published lists",
+)
+
+
+def _is_not_published_error(exc: BaseException) -> bool:
+    """True when the court site has nothing for that date (avoid Cloud Tasks 500 retries)."""
+    text = str(exc).casefold()
+    return any(marker in text for marker in _NOT_PUBLISHED_MARKERS)
+
+
+def _not_published_response(
+    *,
+    court_key: str,
+    date: str,
+    reason: str,
+) -> dict[str, Any]:
+    mark_not_published(court=court_key, date=date)
+    log.warning(
+        "scrape not_published court=%s date=%s reason=%s",
+        court_key,
+        date,
+        reason,
+    )
+    return {
+        "status": "not_published",
+        "court": court_key,
+        "date": date,
+        "pdf_count": 0,
+        "reason": reason,
+    }
+
 
 def _should_cleanup_local_output() -> bool:
     """Cloud Run / real cloud: drop local scrape artifacts after GCS (or HTML upsert)."""
@@ -123,6 +161,12 @@ def handle_scrape(*, court: str, date: str) -> dict[str, Any]:
             return result
         raise ValueError(f"unsupported court: {court}")
     except Exception as exc:  # noqa: BLE001
+        if _is_not_published_error(exc):
+            return _not_published_response(
+                court_key=court_key,
+                date=date,
+                reason=str(exc),
+            )
         log.exception("scrape FAILED court=%s date=%s: %s", court_key, date, exc)
         mark_failed(court=court_key, date=date, error=str(exc))
         raise
@@ -381,34 +425,40 @@ def _scrape_pdf_court(
     out_dir.mkdir(parents=True, exist_ok=True)
     log.info("pdf scrape download start script=%s out_dir=%s", script, out_dir)
 
-    if script == "bombay":
-        from all_causelist.bombay import download_bombay_pdfs, iter_downloaded_pdfs
+    try:
+        if script == "bombay":
+            from all_causelist.bombay import download_bombay_pdfs, iter_downloaded_pdfs
 
-        payload = download_bombay_pdfs(date, out_dir)
-    elif script == "odisha":
-        from all_causelist.odisha import download_odisha_pdfs, iter_downloaded_pdfs
+            payload = download_bombay_pdfs(date, out_dir)
+        elif script == "odisha":
+            from all_causelist.odisha import download_odisha_pdfs, iter_downloaded_pdfs
 
-        payload = download_odisha_pdfs(date, out_dir)
-    elif script == "supreme":
-        from all_causelist.supreme import download_sci_pdfs, iter_downloaded_pdfs
+            payload = download_odisha_pdfs(date, out_dir)
+        elif script == "supreme":
+            from all_causelist.supreme import download_sci_pdfs, iter_downloaded_pdfs
 
-        payload = download_sci_pdfs(date, out_dir)
-    else:
-        raise ValueError(f"not a PDF court: {court_key}")
+            payload = download_sci_pdfs(date, out_dir)
+        else:
+            raise ValueError(f"not a PDF court: {court_key}")
+    except Exception as exc:  # noqa: BLE001
+        if _is_not_published_error(exc):
+            return _not_published_response(
+                court_key=court_key,
+                date=date,
+                reason=str(exc),
+            )
+        raise
+
     pdfs = iter_downloaded_pdfs(payload)
 
     log.info("pdf scrape download done court=%s pdf_count=%s", court_key, len(pdfs))
 
     if not pdfs:
-        log.warning("pdf scrape no PDFs published court=%s date=%s", court_key, date)
-        mark_not_published(court=court_key, date=date)
-        return {
-            "status": "not_published",
-            "court": court_key,
-            "date": date,
-            "pdf_count": 0,
-            "payload": payload,
-        }
+        return _not_published_response(
+            court_key=court_key,
+            date=date,
+            reason=f"No PDFs downloaded for {court_key} on {date}",
+        )
 
     jid = job_id(court_key, date)
     mark_parsing(court=court_key, date=date, pdf_total=len(pdfs)) #updating status in scrpe-jbs 

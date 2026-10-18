@@ -1,12 +1,12 @@
-"""Upsert Legixo-shaped mainOutput into causelist + causelistitem.
+"""Upsert Legixo-shaped mainOutput into causelists + causelistsitems.
 
 Local-first defaults:
   MONGO_URI=mongodb://localhost:27017
   MONGO_DB=causelists
 
 Collections (fixed):
-  causeList
-  causelistitem
+  causelists
+  causelistsitems
   casealerttracking
 
 Set MONGO_URI= (empty) to disable sync without removing code.
@@ -40,8 +40,16 @@ except ImportError:
 
 _DEFAULT_URI = "mongodb://localhost:27017"
 _DEFAULT_DB = "causelists"
-_CAUSE_LIST = "causeList"
-_CAUSE_LIST_ITEM = "causelistitem"
+_CAUSE_LIST = (
+    os.environ.get("MONGO_CAUSE_LISTS_COLLECTION")
+    or os.environ.get("MONGO_CAUSE_LIST_COLLECTION")
+    or "causelists"
+).strip()
+_CAUSE_LIST_ITEM = (
+    os.environ.get("MONGO_CAUSE_LISTS_ITEMS_COLLECTION")
+    or os.environ.get("MONGO_CAUSE_LIST_ITEM_COLLECTION")
+    or "causelistsitems"
+).strip()
 _CASE_ALERT_TRACKING = "casealerttracking"
 
 _client: MongoClient | None = None

@@ -21,6 +21,7 @@ from all_causelist.all_schemas.schema import (  # noqa: E402
     compute_fingerprint,
     make_cause_list_item,
     make_external_id,
+    parse_printed_case_number,
 )
 from all_causelist.cloud.court_map import scrape_court_id_from_cnr  # noqa: E402
 from all_causelist.cloud.notify import post_cause_list_notify  # noqa: E402
@@ -89,6 +90,34 @@ class FingerprintContractTests(unittest.TestCase):
         fp = _fp(listing_section=None, court_no=None)
         self.assertEqual(len(fp), 64)
         self.assertEqual(fp, _fp())
+
+
+class PrintedCaseTypeTests(unittest.TestCase):
+    def test_keeps_dots_uppercase_drops_spaces_and_trailing_hyphen(self) -> None:
+        samples = {
+            "CO.PET. - 153/1998": "CO.PET.",
+            "co.pet. - 153/1998": "CO.PET.",
+            "W.P.(C) No. 180/2004": "W.P.(C)",
+            "w.p.(c) no. 180/2004": "W.P.(C)",
+            "WP/2166/2009": "WP",
+            "C.A. No. 329-330/2004 101. Connected": "C.A.",
+            "CO.APPL. 1804/2017": "CO.APPL.",
+            "COMP - 7/2008": "COMP",
+            "WP - 19459/2016 (S)": "WP",
+            "WP-2166/2009": "WP",
+        }
+        for printed, case_type in samples.items():
+            parsed = parse_printed_case_number(printed)
+            self.assertEqual(parsed.get("caseType"), case_type, printed)
+
+    def test_cause_list_item_stores_printed_type(self) -> None:
+        item = make_cause_list_item(
+            hearing_date="2026-10-14",
+            case_numbers="CO.PET. - 153/1998",
+        )
+        self.assertEqual(item["identities"]["caseType"], "CO.PET.")
+        self.assertEqual(item["identities"]["rootCaseNumber"], "153")
+        self.assertEqual(item["identities"]["caseYear"], "1998")
 
 
 class ChecksumContractTests(unittest.TestCase):
@@ -737,8 +766,9 @@ class TrackedItemFilterTests(unittest.TestCase):
             "causelists": mock_docs,
             "causelistitems": mock_items,
         }[name]
+        parent_id = ObjectId()
         upsert_res = MagicMock()
-        upsert_res.upserted_id = ObjectId()
+        upsert_res.upserted_id = parent_id
         upsert_res.modified_count = 0
         mock_docs.update_one.return_value = upsert_res
         bulk = MagicMock()
@@ -756,14 +786,226 @@ class TrackedItemFilterTests(unittest.TestCase):
                 ):
                     result = mongo.upsert_main_output(main)
 
+        from pymongo import UpdateOne
+
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["items_in"], 2)
         self.assertEqual(result["items_kept"], 1)
         self.assertEqual(result["items_discarded"], 1)
+        self.assertEqual(result["items_upserted"], 1)
         mock_docs.update_one.assert_called_once()
         mock_items.bulk_write.assert_called_once()
         ops = mock_items.bulk_write.call_args[0][0]
         self.assertEqual(len(ops), 1)
+        self.assertIsInstance(ops[0], UpdateOne)
+        self.assertTrue(ops[0]._upsert)
+        self.assertEqual(ops[0]._filter["documentId"], parent_id)
+        self.assertEqual(ops[0]._filter["identities.caseType"], "WP")
+        self.assertEqual(ops[0]._filter["identities.rootCaseNumber"], "1234")
+        self.assertEqual(ops[0]._filter["identities.caseYear"], "2024")
+
+    def test_main_then_supplementary_same_identity_two_parents_two_items(self) -> None:
+        """Same case on main then supplementary: two CauseLists + two items; main untouched."""
+        import db.mongo as mongo
+        from pymongo import UpdateOne
+
+        def _path_get(doc: dict, path: str):
+            cur: object = doc
+            for part in path.split("."):
+                if not isinstance(cur, dict) or part not in cur:
+                    return None
+                cur = cur[part]
+            return cur
+
+        def _matches(doc: dict, filt: dict) -> bool:
+            for key, val in filt.items():
+                got = _path_get(doc, key) if "." in key else doc.get(key)
+                if got != val:
+                    return False
+            return True
+
+        class _FakeColl:
+            def __init__(self) -> None:
+                self.docs: list[dict] = []
+
+            def update_one(self, filt, update, upsert=False):
+                for doc in self.docs:
+                    if _matches(doc, filt):
+                        before = dict(doc)
+                        doc.update(update.get("$set") or {})
+                        res = MagicMock()
+                        res.upserted_id = None
+                        res.modified_count = 1 if doc != before else 0
+                        return res
+                if not upsert:
+                    res = MagicMock()
+                    res.upserted_id = None
+                    res.modified_count = 0
+                    return res
+                new_id = ObjectId()
+                row: dict = {"_id": new_id}
+                row.update(update.get("$set") or {})
+                for k, v in (update.get("$setOnInsert") or {}).items():
+                    row.setdefault(k, v)
+                # Parent filters are flat (no dotted paths).
+                for k, v in filt.items():
+                    if "." not in k:
+                        row.setdefault(k, v)
+                self.docs.append(row)
+                res = MagicMock()
+                res.upserted_id = new_id
+                res.modified_count = 0
+                return res
+
+            def find_one(self, filt, projection=None):
+                for doc in self.docs:
+                    if _matches(doc, filt):
+                        if projection:
+                            return {k: doc[k] for k in projection if k in doc}
+                        return dict(doc)
+                return None
+
+            def bulk_write(self, ops, ordered=False):
+                upserted = 0
+                modified = 0
+                matched = 0
+                for op in ops:
+                    if not isinstance(op, UpdateOne):
+                        raise TypeError(f"expected UpdateOne, got {type(op)}")
+                    filt = op._filter
+                    update = op._doc
+                    found = None
+                    for doc in self.docs:
+                        if _matches(doc, filt):
+                            found = doc
+                            break
+                    if found is not None:
+                        matched += 1
+                        found.update(update.get("$set") or {})
+                        modified += 1
+                    elif op._upsert:
+                        new_id = ObjectId()
+                        row = {"_id": new_id}
+                        row.update(update.get("$set") or {})
+                        for k, v in (update.get("$setOnInsert") or {}).items():
+                            row.setdefault(k, v)
+                        self.docs.append(row)
+                        upserted += 1
+                    else:
+                        raise AssertionError("update without match and upsert=False")
+                res = MagicMock()
+                res.upserted_count = upserted
+                res.modified_count = modified
+                res.matched_count = matched
+                return res
+
+        fake_docs = _FakeColl()
+        fake_items = _FakeColl()
+
+        mock_db = MagicMock()
+        mock_db.client.admin.command.return_value = {"ok": 1}
+        mock_db.__getitem__.side_effect = lambda name: {
+            "causelists": fake_docs,
+            "causelistitems": fake_items,
+        }[name]
+
+        identities = {
+            "caseType": "WP",
+            "rootCaseNumber": "1234",
+            "caseYear": "2024",
+        }
+        tracked = {("WP", "1234", "2024")}
+
+        def _board(list_type: str, external_id: str, checksum: str, fp: str) -> dict:
+            return {
+                "source": "delhi",
+                "courtKey": "dlhc",
+                "courtLevel": "HC",
+                "hearingDate": "2026-10-19",
+                "listType": list_type,
+                "benchLabel": "BENCH-A",
+                "externalId": external_id,
+                "checksum": checksum,
+                "items": [
+                    {
+                        "fingerprint": fp,
+                        "identities": dict(identities),
+                        "listingNo": 1,
+                    }
+                ],
+            }
+
+        main_payload = {
+            "courtKey": "dlhc",
+            "hearingDate": "2026-10-19",
+            "documents": [_board("main", "ext-main", "chk-main", "fp-main")],
+        }
+        supp_payload = {
+            "courtKey": "dlhc",
+            "hearingDate": "2026-10-19",
+            "documents": [
+                _board("supplementary", "ext-supp", "chk-supp", "fp-supp")
+            ],
+        }
+
+        with patch.object(mongo, "mongo_uri", return_value="mongodb://test"):
+            with patch.object(mongo, "_db", return_value=mock_db):
+                with patch.object(
+                    mongo,
+                    "load_enabled_cause_list_tracking_keys",
+                    return_value=tracked,
+                ):
+                    r1 = mongo.upsert_main_output(main_payload)
+                    main_parents = [dict(d) for d in fake_docs.docs]
+                    main_items = [dict(d) for d in fake_items.docs]
+                    r2 = mongo.upsert_main_output(supp_payload)
+
+        self.assertEqual(r1["status"], "ok", r1)
+        self.assertEqual(r2["status"], "ok", r2)
+        self.assertEqual(r1["documents_upserted"], 1)
+        self.assertEqual(r1["items_upserted"], 1)
+        self.assertEqual(r2["documents_upserted"], 1)
+        self.assertEqual(r2["items_upserted"], 1)
+
+        # Two CauseList parents: main + supplementary
+        self.assertEqual(len(fake_docs.docs), 2)
+        list_types = sorted(d["listType"] for d in fake_docs.docs)
+        self.assertEqual(list_types, ["main", "supplementary"])
+        parent_ids = {d["_id"] for d in fake_docs.docs}
+        self.assertEqual(len(parent_ids), 2)
+
+        main_parent = next(d for d in fake_docs.docs if d["listType"] == "main")
+        supp_parent = next(
+            d for d in fake_docs.docs if d["listType"] == "supplementary"
+        )
+        self.assertNotEqual(main_parent["_id"], supp_parent["_id"])
+
+        # Two CauseListItems; same identity trio; different documentIds
+        self.assertEqual(len(fake_items.docs), 2)
+        item_doc_ids = {i["documentId"] for i in fake_items.docs}
+        self.assertEqual(item_doc_ids, parent_ids)
+
+        main_item = next(
+            i for i in fake_items.docs if i["documentId"] == main_parent["_id"]
+        )
+        supp_item = next(
+            i for i in fake_items.docs if i["documentId"] == supp_parent["_id"]
+        )
+        self.assertEqual(main_item["identities"], identities)
+        self.assertEqual(supp_item["identities"], identities)
+        self.assertEqual(main_item["fingerprint"], "fp-main")
+        self.assertEqual(supp_item["fingerprint"], "fp-supp")
+        self.assertNotEqual(main_item["_id"], supp_item["_id"])
+
+        # Main parent + item frozen after supplementary upsert (no replace/touch)
+        self.assertEqual(main_parents[0]["_id"], main_parent["_id"])
+        self.assertEqual(main_parents[0]["checksum"], main_parent["checksum"])
+        self.assertEqual(main_parents[0]["listType"], "main")
+        self.assertEqual(len(main_items), 1)
+        self.assertEqual(main_items[0]["_id"], main_item["_id"])
+        self.assertEqual(main_items[0]["documentId"], main_parent["_id"])
+        self.assertEqual(main_items[0]["fingerprint"], "fp-main")
+        self.assertEqual(main_items[0]["identities"], identities)
 
 
 class MongoCollectionNamesTests(unittest.TestCase):

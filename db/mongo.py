@@ -161,6 +161,7 @@ def _result(status: str, **counts: Any) -> dict[str, Any]:
         "matched": 0,
         "documents_upserted": 0,
         "items_upserted": 0,
+        "created_items": [],
         "collection": f"{_CAUSE_LIST}+{_CAUSE_LIST_ITEM}",
     }
     base.update(counts)
@@ -657,6 +658,7 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 court_key,
             )
 
+        created_ids: list[ObjectId] = []
         if item_ops:
             chunk = 500
             for i in range(0, len(item_ops), chunk):
@@ -664,6 +666,8 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 items_upserted += bulk.upserted_count
                 items_modified += bulk.modified_count
                 items_matched += bulk.matched_count
+                for oid in (bulk.upserted_ids or {}).values():
+                    created_ids.append(oid)
             sample_fps = []
             for doc in documents:
                 for item in doc.get("items") or []:
@@ -681,6 +685,12 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 sample_fps or "-",
             )
 
+        created_items: list[dict[str, Any]] = []
+        if created_ids:
+            created_items = list(
+                items_coll.find({"_id": {"$in": created_ids}})
+            )
+    
         result = _result(
             "ok",
             upserted=docs_upserted + items_upserted,
@@ -704,8 +714,16 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 for d in documents
                 if isinstance(d, dict)
             ),
+            created_items=created_items,
         )
-        log.info("upsert DONE court=%s %s", court_key, result)
+        log.info(
+            "upsert DONE court=%s status=%s docs_up=%s items_up=%s created=%s",
+            court_key,
+            result.get("status"),
+            docs_upserted,
+            items_upserted,
+            len(created_items),
+        )
         return result
     except (PyMongoError, ValueError, KeyError) as exc:
         reset_client()

@@ -50,6 +50,7 @@ def _fp(**overrides: object) -> str:
         "court_no": None,
         "bench": "BENCH",
         "judges": ["J1"],
+        "list_type": "main",
     }
     base.update(overrides)
     return compute_fingerprint(**base)  # type: ignore[arg-type]
@@ -67,6 +68,7 @@ class FingerprintContractTests(unittest.TestCase):
             listing_no=1,
             purpose="EVIDENCE",
             bench="BENCH",
+            list_type="main",
         )
         item_b = make_cause_list_item(
             hearing_date="2026-10-14",
@@ -76,6 +78,7 @@ class FingerprintContractTests(unittest.TestCase):
             listing_no=1,
             purpose="EVIDENCE",
             bench="BENCH",
+            list_type="main",
         )
         self.assertEqual(item_a["fingerprint"], item_b["fingerprint"])
         self.assertEqual(item_a["fingerprint"], a)
@@ -84,6 +87,33 @@ class FingerprintContractTests(unittest.TestCase):
         base = _fp()
         self.assertNotEqual(base, _fp(purpose="APPEARANCE"))
         self.assertNotEqual(base, _fp(listing_no=2))
+
+    def test_list_type_changes_hash(self) -> None:
+        """Main vs supplementary must differ so Step 3 notify is not fingerprint-gated."""
+        main_fp = _fp(list_type="main")
+        supp_fp = _fp(list_type="supplementary")
+        self.assertNotEqual(main_fp, supp_fp)
+        item_main = make_cause_list_item(
+            hearing_date="2026-10-14",
+            case_numbers="WP/1234/2024",
+            judges=["J1"],
+            listing_no=1,
+            purpose="EVIDENCE",
+            bench="BENCH",
+            list_type="main",
+        )
+        item_supp = make_cause_list_item(
+            hearing_date="2026-10-14",
+            case_numbers="WP/1234/2024",
+            judges=["J1"],
+            listing_no=1,
+            purpose="EVIDENCE",
+            bench="BENCH",
+            list_type="supplementary",
+        )
+        self.assertNotEqual(item_main["fingerprint"], item_supp["fingerprint"])
+        self.assertEqual(item_main["fingerprint"], main_fp)
+        self.assertEqual(item_supp["fingerprint"], supp_fp)
 
     def test_missing_slots_are_null_in_material(self) -> None:
         # diaryNo / section / courtNo null → still stable
@@ -767,6 +797,7 @@ class TrackedItemFilterTests(unittest.TestCase):
             "causelistitems": mock_items,
         }[name]
         parent_id = ObjectId()
+        created_oid = ObjectId()
         upsert_res = MagicMock()
         upsert_res.upserted_id = parent_id
         upsert_res.modified_count = 0
@@ -775,7 +806,19 @@ class TrackedItemFilterTests(unittest.TestCase):
         bulk.upserted_count = 1
         bulk.modified_count = 0
         bulk.matched_count = 0
+        bulk.upserted_ids = {0: created_oid}
         mock_items.bulk_write.return_value = bulk
+        created_doc = {
+            "_id": created_oid,
+            "documentId": parent_id,
+            "fingerprint": "fp-tracked",
+            "identities": {
+                "caseType": "WP",
+                "rootCaseNumber": "1234",
+                "caseYear": "2024",
+            },
+        }
+        mock_items.find.return_value = [created_doc]
 
         with patch.object(mongo, "mongo_uri", return_value="mongodb://test"):
             with patch.object(mongo, "_db", return_value=mock_db):
@@ -793,8 +836,11 @@ class TrackedItemFilterTests(unittest.TestCase):
         self.assertEqual(result["items_kept"], 1)
         self.assertEqual(result["items_discarded"], 1)
         self.assertEqual(result["items_upserted"], 1)
+        self.assertEqual(len(result["created_items"]), 1)
+        self.assertEqual(result["created_items"][0]["_id"], created_oid)
         mock_docs.update_one.assert_called_once()
         mock_items.bulk_write.assert_called_once()
+        mock_items.find.assert_called_once()
         ops = mock_items.bulk_write.call_args[0][0]
         self.assertEqual(len(ops), 1)
         self.assertIsInstance(ops[0], UpdateOne)
@@ -865,11 +911,19 @@ class TrackedItemFilterTests(unittest.TestCase):
                         return dict(doc)
                 return None
 
+            def find(self, filt, projection=None):
+                id_clause = filt.get("_id") if isinstance(filt, dict) else None
+                if isinstance(id_clause, dict) and "$in" in id_clause:
+                    wanted = set(id_clause["$in"])
+                    return [dict(d) for d in self.docs if d["_id"] in wanted]
+                return [dict(d) for d in self.docs if _matches(d, filt)]
+
             def bulk_write(self, ops, ordered=False):
                 upserted = 0
                 modified = 0
                 matched = 0
-                for op in ops:
+                upserted_ids: dict[int, ObjectId] = {}
+                for i, op in enumerate(ops):
                     if not isinstance(op, UpdateOne):
                         raise TypeError(f"expected UpdateOne, got {type(op)}")
                     filt = op._filter
@@ -890,6 +944,7 @@ class TrackedItemFilterTests(unittest.TestCase):
                         for k, v in (update.get("$setOnInsert") or {}).items():
                             row.setdefault(k, v)
                         self.docs.append(row)
+                        upserted_ids[i] = new_id
                         upserted += 1
                     else:
                         raise AssertionError("update without match and upsert=False")
@@ -897,6 +952,7 @@ class TrackedItemFilterTests(unittest.TestCase):
                 res.upserted_count = upserted
                 res.modified_count = modified
                 res.matched_count = matched
+                res.upserted_ids = upserted_ids
                 return res
 
         fake_docs = _FakeColl()
@@ -959,13 +1015,20 @@ class TrackedItemFilterTests(unittest.TestCase):
                     main_parents = [dict(d) for d in fake_docs.docs]
                     main_items = [dict(d) for d in fake_items.docs]
                     r2 = mongo.upsert_main_output(supp_payload)
+                    # Same main list again → UpdateOne match, no new create
+                    r3 = mongo.upsert_main_output(main_payload)
 
         self.assertEqual(r1["status"], "ok", r1)
         self.assertEqual(r2["status"], "ok", r2)
         self.assertEqual(r1["documents_upserted"], 1)
         self.assertEqual(r1["items_upserted"], 1)
+        self.assertEqual(len(r1["created_items"]), 1)
         self.assertEqual(r2["documents_upserted"], 1)
         self.assertEqual(r2["items_upserted"], 1)
+        self.assertEqual(len(r2["created_items"]), 1)
+        self.assertEqual(r3["status"], "ok", r3)
+        self.assertEqual(r3["items_upserted"], 0)
+        self.assertEqual(len(r3["created_items"]), 0)
 
         # Two CauseList parents: main + supplementary
         self.assertEqual(len(fake_docs.docs), 2)
@@ -996,6 +1059,8 @@ class TrackedItemFilterTests(unittest.TestCase):
         self.assertEqual(main_item["fingerprint"], "fp-main")
         self.assertEqual(supp_item["fingerprint"], "fp-supp")
         self.assertNotEqual(main_item["_id"], supp_item["_id"])
+        self.assertEqual(r1["created_items"][0]["_id"], main_item["_id"])
+        self.assertEqual(r2["created_items"][0]["_id"], supp_item["_id"])
 
         # Main parent + item frozen after supplementary upsert (no replace/touch)
         self.assertEqual(main_parents[0]["_id"], main_parent["_id"])
@@ -1006,6 +1071,56 @@ class TrackedItemFilterTests(unittest.TestCase):
         self.assertEqual(main_items[0]["documentId"], main_parent["_id"])
         self.assertEqual(main_items[0]["fingerprint"], "fp-main")
         self.assertEqual(main_items[0]["identities"], identities)
+
+    def test_suppl_created_item_notifies_despite_prior_main_fingerprint(self) -> None:
+        """Step 3: new list item is notified even if main already alerted same case."""
+        import db.mongo as mongo
+
+        main_fp = _fp(list_type="main")
+        supp_fp = _fp(list_type="supplementary")
+        self.assertNotEqual(main_fp, supp_fp)
+
+        tracking_row = {
+            "_id": ObjectId(),
+            "cnr": None,
+            "lastFingerprints": {"causeList": main_fp},
+        }
+        coll = MagicMock()
+        coll.find.return_value = [tracking_row]
+        db = MagicMock()
+        db.__getitem__.return_value = coll
+
+        supp_item = {
+            "_id": ObjectId(),
+            "documentId": ObjectId(),
+            "fingerprint": supp_fp,
+            "identities": {
+                "caseType": "WP",
+                "rootCaseNumber": "1234",
+                "caseYear": "2024",
+                "diaryNo": None,
+            },
+        }
+
+        with patch("db.mongo._db", return_value=db):
+            ids = mongo.match_tracking_ids_for_item(supp_item, court_key="dlhc")
+        self.assertEqual(ids, [str(tracking_row["_id"])])
+
+        with patch("db.mongo._db", return_value=db):
+            with patch(
+                "all_causelist.cloud.notify.post_cause_list_notify",
+                return_value={"status": "ok"},
+            ) as post:
+                summary = mongo.match_and_notify_items(
+                    [supp_item], court_key="dlhc"
+                )
+
+        self.assertEqual(summary["matched_items"], 1)
+        self.assertEqual(summary["notify_ok"], 1)
+        post.assert_called_once_with(
+            item_id=str(supp_item["_id"]),
+            tracking_ids=[str(tracking_row["_id"])],
+        )
 
 
 class MongoCollectionNamesTests(unittest.TestCase):

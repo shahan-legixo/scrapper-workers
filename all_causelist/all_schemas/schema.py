@@ -377,9 +377,12 @@ def parse_listing_no(value: Any) -> int | None:
 
 
 def _normalize_case_type(raw: str) -> str:
-    """Uppercase type and strip dots/spaces (Legixo: ``CO.PET.`` → ``COPET``)."""
-    text = re.sub(r"\s+", "", raw.replace(".", "")).upper()
-    # Drop a trailing bare hyphen left by spaced forms.
+    """Store the printed type the way tracking does after parse.
+
+    Uppercase, drop spaces, drop a trailing hyphen. Keep dots
+    (``CO.PET.`` stays ``CO.PET.``, ``W.P.(C)`` stays ``W.P.(C)``).
+    """
+    text = re.sub(r"\s+", "", raw).upper()
     return text.rstrip("-–").strip()
 
 
@@ -414,8 +417,10 @@ def parse_printed_case_number(
         match = pattern.match(clipped) or pattern.match(normalized)
         if match:
             case_type = _normalize_case_type(match.group(1))
-            # SCI ``No.`` prefix forms already captured type without ``No.``
-            if case_type.endswith("NO"):
+            # Drop a glued "No." label. Dots that belong to the type stay.
+            if case_type.endswith("NO."):
+                case_type = case_type[:-3]
+            elif case_type.endswith("NO"):
                 case_type = case_type[:-2]
             if not case_type:
                 continue
@@ -527,8 +532,13 @@ def compute_fingerprint(
     court_no: str | None,
     bench: str | None,
     judges: list[str],
+    list_type: str | None = None,
 ) -> str:
-    """Item fingerprint per HC/SC contract (purpose in, party out)."""
+    """Item fingerprint per HC/SC contract (purpose in, party out).
+
+    ``list_type`` is included so the same case on main vs supplementary
+    (or any other list) gets a distinct fingerprint for notify gating.
+    """
     return sha256_hex(
         [
             identities.get("caseType"),
@@ -542,6 +552,7 @@ def compute_fingerprint(
             court_no,
             bench,
             judges,
+            normalize_list_type_enum(list_type),
         ]
     )
 
@@ -602,6 +613,7 @@ def make_cause_list_item(
     remark: str | None = None,
     advocates: Any = None,
     court_name_value: str | None = None,
+    list_type: str | None = None,
     list_type_display: str | None = None,
     source_url: str | None = None,
     payload_extra: dict[str, Any] | None = None,
@@ -619,6 +631,7 @@ def make_cause_list_item(
     bench_label = (bench or "").strip() or None
     party_text = (party or "").strip() or None
     listing = parse_listing_no(listing_no)
+    list_type_enum = normalize_list_type_enum(list_type)
     identities = parse_case_identities(
         numbers,
         cnr=cnr,
@@ -634,6 +647,7 @@ def make_cause_list_item(
         court_no=court,
         bench=bench_label,
         judges=judge_list,
+        list_type=list_type_enum,
     )
     payload: dict[str, Any] = {}
     if court_name_value:
@@ -736,6 +750,7 @@ def flat_case_to_item(
     hearing_date: str,
     bench_label: str,
     list_type_display: str,
+    list_type: str | None = None,
     source_url: str | None = None,
 ) -> dict[str, Any]:
     """Convert a scraper ``make_case`` row into a CauseListItem."""
@@ -780,6 +795,7 @@ def flat_case_to_item(
         remark=row.get("remark"),
         advocates=row.get("advocates"),
         court_name_value=row.get("courtName"),
+        list_type=list_type,
         list_type_display=list_type_display or row.get("list_type"),
         source_url=source_url
         or row.get("source_url")
@@ -852,6 +868,7 @@ def group_flat_cases_to_documents(
                 hearing_date=hearing_date,
                 bench_label=info["benchLabel"],
                 list_type_display=info["list_type_display"],
+                list_type=info["listType"],
                 source_url=info["source_url"],
             )
             for row in rows

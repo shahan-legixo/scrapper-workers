@@ -486,6 +486,16 @@ class NotPublishedGateTests(unittest.TestCase):
             )
         )
 
+    def test_coram_table_missing_is_not_published_error(self) -> None:
+        from all_causelist.bombay import BombayCauseListError
+        from all_causelist.cloud.handlers import _is_not_published_error
+
+        self.assertTrue(
+            _is_not_published_error(
+                BombayCauseListError("Coram HTML table was missing.")
+            )
+        )
+
     def test_captcha_and_csrf_are_not_not_published(self) -> None:
         from all_causelist.cloud.handlers import _is_not_published_error
         from all_causelist.delhi import CauseListError

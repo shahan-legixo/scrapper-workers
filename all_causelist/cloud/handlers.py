@@ -52,6 +52,7 @@ _NOT_PUBLISHED_MARKERS = (
     "no cause list published",
     "no bombay cause list",
     "empty coram table",
+    "coram html table was missing",
     "could not parse coram rows",
     "could not parse published lists",
     "bench dropdown was empty",

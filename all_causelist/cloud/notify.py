@@ -16,12 +16,18 @@ def notify_url() -> str | None:
     return value or None
 
 
+def notify_internal_token() -> str | None:
+    """Shared secret with backend_legixo ``LEX_INTERNAL_SERVICE_TOKEN``."""
+    value = (os.environ.get("LEX_INTERNAL_SERVICE_TOKEN") or "").strip()
+    return value or None
+
+
 def post_cause_list_notify(
     *,
     item_id: str,
     tracking_ids: list[str],
 ) -> dict[str, Any]:
-    """POST { itemId, trackingIds }. Failures are logged; never raise."""
+    """POST { itemId, trackingIds } with X-Internal-Token. Failures logged; never raise."""
     url = notify_url()
     if not url:
         log.info("notify SKIP no CAUSE_LIST_NOTIFY_URL itemId=%s", item_id)
@@ -30,7 +36,19 @@ def post_cause_list_notify(
         log.info("notify SKIP no trackingIds itemId=%s", item_id)
         return {"status": "skipped_no_tracking", "itemId": item_id}
 
+    token = notify_internal_token()
+    if not token:
+        log.info(
+            "notify SKIP no LEX_INTERNAL_SERVICE_TOKEN itemId=%s",
+            item_id,
+        )
+        return {"status": "skipped_no_token", "itemId": item_id}
+
     body = {"itemId": item_id, "trackingIds": list(tracking_ids)}
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Token": token,
+    }
     log.info(
         "notify request itemId=%s tracking_count=%s url=%s",
         item_id,
@@ -38,7 +56,7 @@ def post_cause_list_notify(
         url,
     )
     try:
-        response = httpx.post(url, json=body, timeout=15.0)
+        response = httpx.post(url, json=body, headers=headers, timeout=20.0)
         if response.status_code >= 400:
             log.warning(
                 "notify HTTP %s itemId=%s tracking=%s body=%s",

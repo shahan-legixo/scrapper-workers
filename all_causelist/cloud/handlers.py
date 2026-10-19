@@ -54,6 +54,8 @@ _NOT_PUBLISHED_MARKERS = (
     "empty coram table",
     "could not parse coram rows",
     "could not parse published lists",
+    "bench dropdown was empty",
+    "judge dropdown was empty",
 )
 
 
@@ -614,16 +616,38 @@ def _scrape_html_court(
             )
             doc = json.loads(main_path.read_text(encoding="utf-8"))
         item_count = int(doc.get("item_count") or doc.get("case_count") or 0)
+        documents = doc.get("documents") if isinstance(doc.get("documents"), list) else []
+        if item_count == 0 and not documents:
+            cleaned = False
+            if _should_cleanup_local_output() and main_path.is_file():
+                day_dir = main_path.parent
+                if day_dir.name.startswith("causelist-"):
+                    _safe_rmtree(day_dir)
+                else:
+                    _safe_unlink(main_path)
+                cleaned = True
+            out = _not_published_response(
+                court_key=court_key,
+                date=date,
+                reason=f"No cause list items for {court_key} on {date}",
+            )
+            out["path"] = "html_single_stage"
+            out["item_count"] = 0
+            out["local_output_cleaned"] = cleaned
+            return out
         mongo, notify = _upsert_html_documents_with_checksum_gate(
             court_key=court_key,
             main_output=doc,
         )
     else:
-        mongo = {"status": "skipped_no_file"}
-        item_count = int(result.get("case_count") or 0)
+        return _not_published_response(
+            court_key=court_key,
+            date=date,
+            reason=f"No mainOutput.json for {court_key} on {date}",
+        )
 
     # HTML: no PDFs — mark complete via parsing with total 0 / or complete status
-    mark_parsing(court=court_key, date=date, pdf_total=0) 
+    mark_parsing(court=court_key, date=date, pdf_total=0)
     from all_causelist.cloud.jobs import set_job_status, STATUS_COMPLETE
 
     set_job_status(court=court_key, date=date, status=STATUS_COMPLETE)

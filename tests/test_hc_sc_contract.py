@@ -133,15 +133,15 @@ class CourtMapTests(unittest.TestCase):
 class MatchTrackingTests(unittest.TestCase):
     def test_enabled_trio_hit_and_cnr_court_filter(self) -> None:
         item = {
+            "fingerprint": "fp-listing-1",
             "identities": {
                 "caseType": "WP",
                 "rootCaseNumber": "1234",
                 "caseYear": "2024",
-            }
+            },
         }
         hit = {"_id": ObjectId(), "cnr": "DLHC010012342024"}
         miss_court = {"_id": ObjectId(), "cnr": "HCBM010012342024"}
-        disabled_would_not_be_in_cursor = hit  # query already filters enabled
 
         coll = MagicMock()
         coll.find.return_value = [hit, miss_court]
@@ -156,15 +156,18 @@ class MatchTrackingTests(unittest.TestCase):
         self.assertTrue(query["enabled"])
         self.assertTrue(query["events.causeList"])
         self.assertEqual(query["identities.caseType"], "WP")
+        projection = coll.find.call_args[0][1]
+        self.assertIn("lastFingerprints.causeList", projection)
 
     def test_diary_required_when_item_has_diary(self) -> None:
         item = {
+            "fingerprint": "fp-listing-1",
             "identities": {
                 "caseType": "WP",
                 "rootCaseNumber": "1234",
                 "caseYear": "2024",
                 "diaryNo": "12/2024",
-            }
+            },
         }
         coll = MagicMock()
         coll.find.return_value = []
@@ -177,10 +180,71 @@ class MatchTrackingTests(unittest.TestCase):
         query = coll.find.call_args[0][0]
         self.assertEqual(query["identities.diaryNo"], "12/2024")
 
+    def test_skips_tracking_when_last_fingerprint_matches(self) -> None:
+        item = {
+            "fingerprint": "fp-same",
+            "identities": {
+                "caseType": "WP",
+                "rootCaseNumber": "1234",
+                "caseYear": "2024",
+            },
+        }
+        already_alerted = {
+            "_id": ObjectId(),
+            "cnr": "DLHC010012342024",
+            "lastFingerprints": {"causeList": "fp-same"},
+        }
+        needs_alert = {
+            "_id": ObjectId(),
+            "cnr": "DLHC010099992024",
+            "lastFingerprints": {"causeList": "fp-old"},
+        }
+        first_alert = {
+            "_id": ObjectId(),
+            "cnr": "DLHC010088882024",
+        }
+
+        coll = MagicMock()
+        coll.find.return_value = [already_alerted, needs_alert, first_alert]
+        db = MagicMock()
+        db.__getitem__.return_value = coll
+
+        with patch("db.mongo._db", return_value=db):
+            ids = match_tracking_ids_for_item(item, court_key="dlhc")
+
+        self.assertEqual(
+            ids,
+            [str(needs_alert["_id"]), str(first_alert["_id"])],
+        )
+
+    def test_no_fingerprint_returns_empty(self) -> None:
+        item = {
+            "identities": {
+                "caseType": "WP",
+                "rootCaseNumber": "1234",
+                "caseYear": "2024",
+            }
+        }
+        coll = MagicMock()
+        db = MagicMock()
+        db.__getitem__.return_value = coll
+
+        with patch("db.mongo._db", return_value=db):
+            ids = match_tracking_ids_for_item(item, court_key="dlhc")
+
+        self.assertEqual(ids, [])
+        coll.find.assert_not_called()
+
 
 class NotifyClientTests(unittest.TestCase):
     def test_http_error_does_not_raise(self) -> None:
-        with patch.dict(os.environ, {"CAUSE_LIST_NOTIFY_URL": "https://example.invalid/x"}):
+        with patch.dict(
+            os.environ,
+            {
+                "CAUSE_LIST_NOTIFY_URL": "https://example.invalid/x",
+                "LEX_INTERNAL_SERVICE_TOKEN": "test-internal-token",
+            },
+        ):
             with patch("httpx.post", side_effect=TimeoutError("boom")):
                 result = post_cause_list_notify(
                     item_id=str(ObjectId()),
@@ -197,6 +261,56 @@ class NotifyClientTests(unittest.TestCase):
                 tracking_ids=[str(ObjectId())],
             )
         self.assertEqual(result["status"], "skipped_no_url")
+
+    def test_skipped_when_token_empty(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "CAUSE_LIST_NOTIFY_URL": "https://example.invalid/x",
+                "LEX_INTERNAL_SERVICE_TOKEN": "",
+            },
+            clear=False,
+        ):
+            with patch("httpx.post") as post:
+                result = post_cause_list_notify(
+                    item_id=str(ObjectId()),
+                    tracking_ids=[str(ObjectId())],
+                )
+        self.assertEqual(result["status"], "skipped_no_token")
+        post.assert_not_called()
+
+    def test_sends_internal_token_header(self) -> None:
+        item_id = str(ObjectId())
+        tracking_id = str(ObjectId())
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = ""
+
+        with patch.dict(
+            os.environ,
+            {
+                "CAUSE_LIST_NOTIFY_URL": "https://example.invalid/internal/cause-list-alerts",
+                "LEX_INTERNAL_SERVICE_TOKEN": "test-internal-token",
+            },
+        ):
+            with patch("httpx.post", return_value=mock_response) as post:
+                result = post_cause_list_notify(
+                    item_id=item_id,
+                    tracking_ids=[tracking_id],
+                )
+
+        self.assertEqual(result["status"], "ok")
+        post.assert_called_once()
+        kwargs = post.call_args.kwargs
+        self.assertEqual(
+            kwargs["json"],
+            {"itemId": item_id, "trackingIds": [tracking_id]},
+        )
+        self.assertEqual(kwargs["headers"]["Content-Type"], "application/json")
+        self.assertEqual(
+            kwargs["headers"]["X-Internal-Token"],
+            "test-internal-token",
+        )
 
 
 class ExternalIdContractTests(unittest.TestCase):
@@ -349,14 +463,99 @@ class StoreRematchFlowTests(unittest.TestCase):
         self.assertEqual(result["mongodb"]["status"], "checksum_unchanged")
 
 
+class NotPublishedGateTests(unittest.TestCase):
+    """Empty court lists → not_published (HTTP 200); captcha/CSRF stay failures."""
+
+    def test_empty_bench_is_not_published_error(self) -> None:
+        from all_causelist.cloud.handlers import _is_not_published_error
+        from all_causelist.delhi import CauseListError
+
+        self.assertTrue(
+            _is_not_published_error(
+                CauseListError("Bench dropdown was empty for this date.")
+            )
+        )
+
+    def test_empty_judge_is_not_published_error(self) -> None:
+        from all_causelist.cloud.handlers import _is_not_published_error
+        from all_causelist.telangana import TelanganaCauseListError
+
+        self.assertTrue(
+            _is_not_published_error(
+                TelanganaCauseListError("Judge dropdown was empty for this date.")
+            )
+        )
+
+    def test_captcha_and_csrf_are_not_not_published(self) -> None:
+        from all_causelist.cloud.handlers import _is_not_published_error
+        from all_causelist.delhi import CauseListError
+
+        self.assertFalse(
+            _is_not_published_error(
+                CauseListError("Captcha refresh did not return a code.")
+            )
+        )
+        self.assertFalse(
+            _is_not_published_error(CauseListError("CSRF token was missing."))
+        )
+        self.assertFalse(
+            _is_not_published_error(
+                CauseListError("Validation code was rejected after one refresh.")
+            )
+        )
+
+    def test_handle_scrape_empty_bench_returns_not_published(self) -> None:
+        from all_causelist.cloud import handlers
+        from all_causelist.delhi import CauseListError
+
+        with patch.object(handlers, "mark_downloading"):
+            with patch.object(
+                handlers,
+                "_scrape_html_court",
+                side_effect=CauseListError(
+                    "Bench dropdown was empty for this date."
+                ),
+            ):
+                with patch.object(handlers, "mark_not_published") as mnp:
+                    with patch.object(handlers, "mark_failed") as failed:
+                        result = handlers.handle_scrape(
+                            court="dlhc", date="2026-10-14"
+                        )
+        self.assertEqual(result["status"], "not_published")
+        self.assertEqual(result["court"], "dlhc")
+        self.assertEqual(result["date"], "2026-10-14")
+        mnp.assert_called_once_with(court="dlhc", date="2026-10-14")
+        failed.assert_not_called()
+
+    def test_handle_scrape_captcha_still_raises(self) -> None:
+        from all_causelist.cloud import handlers
+        from all_causelist.delhi import CauseListError
+
+        with patch.object(handlers, "mark_downloading"):
+            with patch.object(
+                handlers,
+                "_scrape_html_court",
+                side_effect=CauseListError(
+                    "Captcha refresh did not return a code."
+                ),
+            ):
+                with patch.object(handlers, "mark_not_published") as mnp:
+                    with patch.object(handlers, "mark_failed") as failed:
+                        with self.assertRaises(CauseListError):
+                            handlers.handle_scrape(court="dlhc", date="2026-10-14")
+        mnp.assert_not_called()
+        failed.assert_called_once()
+        self.assertIn("Captcha", failed.call_args.kwargs["error"])
+
+
 class MongoCollectionNamesTests(unittest.TestCase):
     def test_collection_names_default(self) -> None:
         import db.mongo as mongo
         self.assertEqual(mongo.mongo_collection_name(), "causelists")
         self.assertEqual(mongo._CAUSE_LIST, "causelists")
-        self.assertEqual(mongo._CAUSE_LIST_ITEM, "causelistsitems")
+        self.assertEqual(mongo._CAUSE_LIST_ITEM, "causelistitems")
         result = mongo._result("ok")
-        self.assertEqual(result["collection"], "causelists+causelistsitems")
+        self.assertEqual(result["collection"], "causelists+causelistitems")
 
     def test_find_cause_list_unit_targets_causelists_collection(self) -> None:
         import db.mongo as mongo
@@ -380,7 +579,7 @@ class MongoCollectionNamesTests(unittest.TestCase):
         mock_db.__getitem__.return_value = mock_coll
         with patch("db.mongo._db", return_value=mock_db):
             mongo.list_items_for_document(ObjectId())
-        mock_db.__getitem__.assert_called_with("causelistsitems")
+        mock_db.__getitem__.assert_called_with("causelistitems")
 
 
 if __name__ == "__main__":

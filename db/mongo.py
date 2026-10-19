@@ -1,4 +1,4 @@
-"""Upsert Legixo-shaped mainOutput into causelists + causelistsitems.
+"""Upsert Legixo-shaped mainOutput into causelists + causelistitems.
 
 Local-first defaults:
   MONGO_URI=mongodb://localhost:27017
@@ -6,7 +6,7 @@ Local-first defaults:
 
 Collections (fixed):
   causelists
-  causelistsitems
+  causelistitems
   casealerttracking
 
 Set MONGO_URI= (empty) to disable sync without removing code.
@@ -39,7 +39,7 @@ except ImportError:
     pass
 
 _DEFAULT_URI = "mongodb://localhost:27017"
-_DEFAULT_DB = "causelists"
+_DEFAULT_DB = "test"
 _CAUSE_LIST = (
     os.environ.get("MONGO_CAUSE_LISTS_COLLECTION")
     or os.environ.get("MONGO_CAUSE_LIST_COLLECTION")
@@ -48,7 +48,7 @@ _CAUSE_LIST = (
 _CAUSE_LIST_ITEM = (
     os.environ.get("MONGO_CAUSE_LISTS_ITEMS_COLLECTION")
     or os.environ.get("MONGO_CAUSE_LIST_ITEM_COLLECTION")
-    or "causelistsitems"
+    or "causelistitems"
 ).strip()
 _CASE_ALERT_TRACKING = "casealerttracking"
 
@@ -306,7 +306,11 @@ def match_tracking_ids_for_item(
     *,
     court_key: str,
 ) -> list[str]:
-    """Query CaseAlertTracking for one item; return tracking ObjectId strings."""
+    """Query CaseAlertTracking; return IDs that still need notify (fingerprint gate).
+
+    Skips trackings where ``lastFingerprints.causeList`` already equals the
+    item fingerprint (same listing already alerted).
+    """
     db = _db()
     if db is None:
         return []
@@ -316,6 +320,15 @@ def match_tracking_ids_for_item(
     root = (identities.get("rootCaseNumber") or "").strip()
     year = (identities.get("caseYear") or "").strip()
     if not case_type or not root or not year:
+        return []
+
+    item_fp = str(item.get("fingerprint") or "").strip()
+    if not item_fp:
+        log.info(
+            "tracking SKIP no item fingerprint court=%s itemId=%s",
+            court_key,
+            item.get("_id"),
+        )
         return []
 
     query: dict[str, Any] = {
@@ -332,24 +345,41 @@ def match_tracking_ids_for_item(
     from all_causelist.cloud.court_map import scrape_court_id_from_cnr
 
     tracking_ids: list[str] = []
-    for row in db[_CASE_ALERT_TRACKING].find(query, {"_id": 1, "cnr": 1}):
+    skipped_fingerprint = 0
+    for row in db[_CASE_ALERT_TRACKING].find(
+        query,
+        {"_id": 1, "cnr": 1, "lastFingerprints.causeList": 1},
+    ):
         cnr = row.get("cnr")
         if cnr:
             mapped = scrape_court_id_from_cnr(str(cnr))
             if mapped is not None and mapped != court_key:
                 continue
+        last_fps = row.get("lastFingerprints") or {}
+        last_fp = str(last_fps.get("causeList") or "").strip()
+        if last_fp and last_fp == item_fp:
+            skipped_fingerprint += 1
+            log.info(
+                "tracking SKIP fingerprint court=%s itemId=%s trackingId=%s fp=%s...",
+                court_key,
+                item.get("_id"),
+                row["_id"],
+                item_fp[:16],
+            )
+            continue
         tracking_ids.append(str(row["_id"]))
-    if tracking_ids:
-        fp = str(item.get("fingerprint") or "")[:16]
+    if tracking_ids or skipped_fingerprint:
         log.info(
-            "tracking MATCH court=%s itemId=%s fp=%s... case=%s/%s/%s tracking_count=%s",
+            "tracking MATCH court=%s itemId=%s fp=%s... case=%s/%s/%s "
+            "notify_ids=%s skipped_fingerprint=%s",
             court_key,
             item.get("_id"),
-            fp or "-",
+            item_fp[:16],
             case_type,
             root,
             year,
             len(tracking_ids),
+            skipped_fingerprint,
         )
     return tracking_ids
 
@@ -359,7 +389,7 @@ def match_and_notify_items(
     *,
     court_key: str,
 ) -> dict[str, Any]:
-    """For each item: match tracking → POST notify. Never raises."""
+    """For each item: match tracking → fingerprint gate → POST notify. Never raises."""
     from all_causelist.cloud.notify import post_cause_list_notify
 
     log.info("notify loop START court=%s items=%s", court_key, len(items))
@@ -372,6 +402,8 @@ def match_and_notify_items(
             continue
         tracking_ids = match_tracking_ids_for_item(item, court_key=court_key)
         if not tracking_ids:
+            # Identity miss, no fingerprint, or all trackings already alerted.
+            notify_skip += 1
             continue
         matched_items += 1
         fp = str(item.get("fingerprint") or "")[:16]
@@ -389,7 +421,7 @@ def match_and_notify_items(
         status = result.get("status")
         if status == "ok":
             notify_ok += 1
-        elif status in ("skipped_no_url", "skipped_no_tracking"):
+        elif status in ("skipped_no_url", "skipped_no_tracking", "skipped_no_token"):
             notify_skip += 1
             log.info(
                 "notify SKIPPED status=%s itemId=%s",

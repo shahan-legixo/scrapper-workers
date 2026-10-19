@@ -287,6 +287,95 @@ def find_cause_list_unit(
         }
     )
 
+def cause_list_items_enabled_tracking() -> list[dict[str, Any]]:
+    """Load enabled CaseAlertTracking rows with cause-list toggle on."""
+    db = _db()
+    if db is None:
+        return []
+    return list(
+        db[_CASE_ALERT_TRACKING].find(
+            {"enabled": True, "events.causeList": True},
+            {"identities": 1, "cnr": 1},
+        )
+    )
+
+
+def _identity_key(
+    identities: dict[str, Any] | None,
+) -> tuple[str, str, str] | None:
+    """Normalize identities to (caseType, rootCaseNumber, caseYear), or None."""
+    idn = identities or {}
+    case_type = (idn.get("caseType") or "").strip().upper()
+    root = (idn.get("rootCaseNumber") or "").strip()
+    year = (idn.get("caseYear") or "").strip()
+    if not case_type or not root or not year:
+        return None
+    return (case_type, root, year)
+
+
+def load_enabled_cause_list_tracking_keys(
+    court_key: str,
+) -> set[tuple[str, str, str]]:
+    """Build identity key set for tracked cases (optional CNR→court filter)."""
+    from all_causelist.cloud.court_map import scrape_court_id_from_cnr
+
+    keys: set[tuple[str, str, str]] = set()
+    for row in cause_list_items_enabled_tracking():
+        cnr = row.get("cnr")
+        if cnr:
+            mapped = scrape_court_id_from_cnr(str(cnr))
+            if mapped is not None and mapped != court_key:
+                continue
+        raw_idn = row.get("identities")
+        key = _identity_key(raw_idn if isinstance(raw_idn, dict) else None)
+        if key is not None:
+            keys.add(key)
+    return keys
+
+
+def filter_documents_to_tracked(
+    documents: list[Any],
+    *,
+    court_key: str,
+    tracked_keys: set[tuple[str, str, str]] | None = None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Keep only items whose identities match enabled cause-list tracking.
+
+    Returns (filtered_documents, items_in, items_kept).
+    Parents with zero kept items are dropped.
+    """
+    keys = (
+        tracked_keys
+        if tracked_keys is not None
+        else load_enabled_cause_list_tracking_keys(court_key)
+    )
+    items_in = 0
+    items_kept = 0
+    out: list[dict[str, Any]] = []
+
+    for doc in documents:
+        if not isinstance(doc, dict):
+            continue
+        raw_items = doc.get("items") or []
+        if not isinstance(raw_items, list):
+            raw_items = []
+        items_in += len(raw_items)
+        kept: list[dict[str, Any]] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            raw_idn = item.get("identities")
+            key = _identity_key(raw_idn if isinstance(raw_idn, dict) else None)
+            if key is not None and key in keys:
+                kept.append(item)
+        items_kept += len(kept)
+        if not kept:
+            continue
+        filtered = dict(doc)
+        filtered["items"] = kept
+        out.append(filtered)
+    return out, items_in, items_kept
+
 
 def list_items_for_document(document_id: ObjectId | str) -> list[dict[str, Any]]:
     """Load CauseListItems for a parent CauseList."""
@@ -319,6 +408,8 @@ def match_tracking_ids_for_item(
     case_type = (identities.get("caseType") or "").strip().upper()
     root = (identities.get("rootCaseNumber") or "").strip()
     year = (identities.get("caseYear") or "").strip()
+
+
     if not case_type or not root or not year:
         return []
 
@@ -330,6 +421,7 @@ def match_tracking_ids_for_item(
             item.get("_id"),
         )
         return []
+        
 
     query: dict[str, Any] = {
         "enabled": True,
@@ -479,6 +571,34 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
         items_skipped_no_fp = 0
         item_ops: list[UpdateOne] = []
 
+        tracked_keys = load_enabled_cause_list_tracking_keys(court_key)
+        documents, items_in, items_kept = filter_documents_to_tracked(
+            documents,
+            court_key=court_key,
+            tracked_keys=tracked_keys,
+        )
+        items_discarded = items_in - items_kept
+        log.info(
+            "upsert tracking filter court=%s items_in=%s items_kept=%s "
+            "items_discarded=%s tracked_keys=%s docs_kept=%s",
+            court_key,
+            items_in,
+            items_kept,
+            items_discarded,
+            len(tracked_keys),
+            len(documents),
+        )
+        if not documents:
+            return _result(
+                "skipped_no_tracked_items",
+                items_in=items_in,
+                items_kept=0,
+                items_discarded=items_discarded,
+                document_count=0,
+                item_count=0,
+                case_count=0,
+            )
+
         for doc in documents:
             if not isinstance(doc, dict):
                 continue
@@ -486,6 +606,7 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
             filt = _parent_filter(doc, hearing)
             fields = _parent_set(doc, hearing, now)
             checksum = doc.get("checksum")
+
             log.info(
                 "upsert CauseList court=%s externalId=%s checksum=%s... items=%s",
                 doc.get("courtKey") or court_key,
@@ -566,6 +687,9 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
             documents_modified=docs_modified,
             items_upserted=items_upserted,
             items_modified=items_modified,
+            items_in=items_in,
+            items_kept=items_kept,
+            items_discarded=items_discarded,
             document_count=len(documents),
             item_count=sum(
                 len(d.get("items") or [])

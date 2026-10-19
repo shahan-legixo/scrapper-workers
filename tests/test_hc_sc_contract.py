@@ -558,6 +558,214 @@ class NotPublishedGateTests(unittest.TestCase):
         self.assertIn("Captcha", failed.call_args.kwargs["error"])
 
 
+class TrackedItemFilterTests(unittest.TestCase):
+    """Step 1: only upsert CauseListItems that match enabled cause-list tracking."""
+
+    def test_identity_key_trio_only(self) -> None:
+        import db.mongo as mongo
+
+        self.assertEqual(
+            mongo._identity_key(
+                {
+                    "caseType": "wp",
+                    "rootCaseNumber": "1234",
+                    "caseYear": "2024",
+                }
+            ),
+            ("WP", "1234", "2024"),
+        )
+        # diaryNo is ignored for Step 1 match keys
+        self.assertEqual(
+            mongo._identity_key(
+                {
+                    "caseType": "WP",
+                    "rootCaseNumber": "1234",
+                    "caseYear": "2024",
+                    "diaryNo": " 99 ",
+                }
+            ),
+            ("WP", "1234", "2024"),
+        )
+        self.assertIsNone(mongo._identity_key({"caseType": "WP"}))
+
+    def test_filter_keeps_tracked_drops_untracked(self) -> None:
+        import db.mongo as mongo
+
+        tracked = {("WP", "1234", "2024")}
+        docs = [
+            {
+                "courtKey": "dlhc",
+                "items": [
+                    {
+                        "fingerprint": "a",
+                        "identities": {
+                            "caseType": "WP",
+                            "rootCaseNumber": "1234",
+                            "caseYear": "2024",
+                        },
+                    },
+                    {
+                        "fingerprint": "b",
+                        "identities": {
+                            "caseType": "CRL",
+                            "rootCaseNumber": "9",
+                            "caseYear": "2020",
+                        },
+                    },
+                ],
+            }
+        ]
+        filtered, items_in, items_kept = mongo.filter_documents_to_tracked(
+            docs, court_key="dlhc", tracked_keys=tracked
+        )
+        self.assertEqual(items_in, 2)
+        self.assertEqual(items_kept, 1)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(len(filtered[0]["items"]), 1)
+        self.assertEqual(
+            filtered[0]["items"][0]["identities"]["rootCaseNumber"], "1234"
+        )
+
+    def test_filter_drops_empty_documents(self) -> None:
+        import db.mongo as mongo
+
+        docs = [
+            {
+                "courtKey": "dlhc",
+                "items": [
+                    {
+                        "fingerprint": "x",
+                        "identities": {
+                            "caseType": "WP",
+                            "rootCaseNumber": "1",
+                            "caseYear": "2020",
+                        },
+                    }
+                ],
+            }
+        ]
+        filtered, items_in, items_kept = mongo.filter_documents_to_tracked(
+            docs, court_key="dlhc", tracked_keys=set()
+        )
+        self.assertEqual(items_in, 1)
+        self.assertEqual(items_kept, 0)
+        self.assertEqual(filtered, [])
+
+    def test_upsert_skips_when_no_tracked_items(self) -> None:
+        import db.mongo as mongo
+
+        main = {
+            "courtKey": "dlhc",
+            "hearingDate": "2026-10-19",
+            "documents": [
+                {
+                    "source": "delhi",
+                    "courtKey": "dlhc",
+                    "courtLevel": "HC",
+                    "hearingDate": "2026-10-19",
+                    "listType": "main",
+                    "benchLabel": "BENCH",
+                    "externalId": "ext-1",
+                    "checksum": "abc",
+                    "items": [
+                        {
+                            "fingerprint": "fp1",
+                            "identities": {
+                                "caseType": "WP",
+                                "rootCaseNumber": "1",
+                                "caseYear": "2024",
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        mock_db = MagicMock()
+        mock_db.client.admin.command.return_value = {"ok": 1}
+        with patch.object(mongo, "mongo_uri", return_value="mongodb://test"):
+            with patch.object(mongo, "_db", return_value=mock_db):
+                with patch.object(
+                    mongo, "load_enabled_cause_list_tracking_keys", return_value=set()
+                ):
+                    result = mongo.upsert_main_output(main)
+        self.assertEqual(result["status"], "skipped_no_tracked_items")
+        self.assertEqual(result["items_kept"], 0)
+        self.assertEqual(result["items_discarded"], 1)
+
+    def test_upsert_writes_only_tracked_items(self) -> None:
+        import db.mongo as mongo
+
+        main = {
+            "courtKey": "dlhc",
+            "hearingDate": "2026-10-19",
+            "documents": [
+                {
+                    "source": "delhi",
+                    "courtKey": "dlhc",
+                    "courtLevel": "HC",
+                    "hearingDate": "2026-10-19",
+                    "listType": "main",
+                    "benchLabel": "BENCH",
+                    "externalId": "ext-1",
+                    "checksum": "abc",
+                    "items": [
+                        {
+                            "fingerprint": "fp-tracked",
+                            "identities": {
+                                "caseType": "WP",
+                                "rootCaseNumber": "1234",
+                                "caseYear": "2024",
+                            },
+                        },
+                        {
+                            "fingerprint": "fp-other",
+                            "identities": {
+                                "caseType": "CRL",
+                                "rootCaseNumber": "9",
+                                "caseYear": "2020",
+                            },
+                        },
+                    ],
+                }
+            ],
+        }
+        mock_db = MagicMock()
+        mock_docs = MagicMock()
+        mock_items = MagicMock()
+        mock_db.client.admin.command.return_value = {"ok": 1}
+        mock_db.__getitem__.side_effect = lambda name: {
+            "causelists": mock_docs,
+            "causelistitems": mock_items,
+        }[name]
+        upsert_res = MagicMock()
+        upsert_res.upserted_id = ObjectId()
+        upsert_res.modified_count = 0
+        mock_docs.update_one.return_value = upsert_res
+        bulk = MagicMock()
+        bulk.upserted_count = 1
+        bulk.modified_count = 0
+        bulk.matched_count = 0
+        mock_items.bulk_write.return_value = bulk
+
+        with patch.object(mongo, "mongo_uri", return_value="mongodb://test"):
+            with patch.object(mongo, "_db", return_value=mock_db):
+                with patch.object(
+                    mongo,
+                    "load_enabled_cause_list_tracking_keys",
+                    return_value={("WP", "1234", "2024")},
+                ):
+                    result = mongo.upsert_main_output(main)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["items_in"], 2)
+        self.assertEqual(result["items_kept"], 1)
+        self.assertEqual(result["items_discarded"], 1)
+        mock_docs.update_one.assert_called_once()
+        mock_items.bulk_write.assert_called_once()
+        ops = mock_items.bulk_write.call_args[0][0]
+        self.assertEqual(len(ops), 1)
+
+
 class MongoCollectionNamesTests(unittest.TestCase):
     def test_collection_names_default(self) -> None:
         import db.mongo as mongo

@@ -291,6 +291,8 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
             sha[:16],
         )
         log.info("parse extracting cases from PDF court=%s", court_key)
+
+        
         block = _cases_from_pdf_for_court(
             court_key,
             pdf_file,
@@ -300,6 +302,9 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
             label=label,
             extra=body,
         )
+
+
+        #it is extracting cases from pdf
         cases = list(block.get("cases") or [])
         for row in cases:
             row_bench = (
@@ -325,6 +330,9 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
             hearing_date=hearing_date,
             cases=cases,
         )
+        
+
+        #it is building main output
         for doc in documents:
             if gcs_uri:
                 doc["rawRef"] = gcs_uri
@@ -343,7 +351,9 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
             cases=[],
             documents=documents,
         )
+
         fp_sample: list[str] = []
+        
         for doc in documents:
             for it in doc.get("items") or []:
                 if isinstance(it, dict) and it.get("fingerprint"):
@@ -359,6 +369,9 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
             main.get("item_count"),
             fp_sample or "-",
         )
+
+
+        #it is upserting main output to mongodb
         mongo = upsert_main_output(main)
         log.info("mongo upsert after checksum change result=%s", mongo)
 

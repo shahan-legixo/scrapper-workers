@@ -107,7 +107,8 @@ def _db():
         docs.create_index([("checksum", 1)])
         docs.create_index([("hearingDate", 1), ("courtLevel", 1), ("listType", 1)])
         items.create_index([("documentId", 1)])
-        # Contract upsert key (replace legacy documentId+fingerprint unique).
+        # Contract upsert key: documentId + identities (+ listingNo).
+        # Drop legacy fingerprint unique so same case can exist on main + supplementary.
         try:
             items.drop_index("documentId_1_fingerprint_1")
         except Exception:  # noqa: BLE001
@@ -160,6 +161,7 @@ def _result(status: str, **counts: Any) -> dict[str, Any]:
         "matched": 0,
         "documents_upserted": 0,
         "items_upserted": 0,
+        "created_items": [],
         "collection": f"{_CAUSE_LIST}+{_CAUSE_LIST_ITEM}",
     }
     base.update(counts)
@@ -614,6 +616,7 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 (str(checksum)[:16] + "...") if checksum else "-",
                 len(doc.get("items") or []),
             )
+            # Parent board upserted (reuse documentId for same date/list/bench).
             res = docs_coll.update_one(
                 filt,
                 {"$set": fields, "$setOnInsert": {"createdAt": now}},
@@ -634,6 +637,8 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 if not isinstance(item, dict) or not item.get("fingerprint"):
                     items_skipped_no_fp += 1
                     continue
+                # Match documentId + identities: same list → update; other list
+                # (e.g. supplementary) has a different documentId → insert new.
                 item_fields = _item_set(item, document_id, hearing, now)
                 item_ops.append(
                     UpdateOne(
@@ -653,14 +658,16 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 court_key,
             )
 
+        created_ids: list[ObjectId] = []
         if item_ops:
-            # Chunk bulk writes to avoid huge payloads.
             chunk = 500
             for i in range(0, len(item_ops), chunk):
                 bulk = items_coll.bulk_write(item_ops[i : i + chunk], ordered=False)
                 items_upserted += bulk.upserted_count
                 items_modified += bulk.modified_count
                 items_matched += bulk.matched_count
+                for oid in (bulk.upserted_ids or {}).values():
+                    created_ids.append(oid)
             sample_fps = []
             for doc in documents:
                 for item in doc.get("items") or []:
@@ -678,6 +685,12 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 sample_fps or "-",
             )
 
+        created_items: list[dict[str, Any]] = []
+        if created_ids:
+            created_items = list(
+                items_coll.find({"_id": {"$in": created_ids}})
+            )
+    
         result = _result(
             "ok",
             upserted=docs_upserted + items_upserted,
@@ -701,8 +714,16 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 for d in documents
                 if isinstance(d, dict)
             ),
+            created_items=created_items,
         )
-        log.info("upsert DONE court=%s %s", court_key, result)
+        log.info(
+            "upsert DONE court=%s status=%s docs_up=%s items_up=%s created=%s",
+            court_key,
+            result.get("status"),
+            docs_upserted,
+            items_upserted,
+            len(created_items),
+        )
         return result
     except (PyMongoError, ValueError, KeyError) as exc:
         reset_client()

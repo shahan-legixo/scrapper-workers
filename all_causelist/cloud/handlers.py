@@ -375,27 +375,14 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
         mongo = upsert_main_output(main)
         log.info("mongo upsert after checksum change result=%s", mongo)
 
-        # Rematch every upserted unit's items (new or checksum-changed).
-        all_items: list[dict[str, Any]] = []
-        for doc in documents:
-            if not isinstance(doc, dict):
-                continue
-            unit = find_cause_list_unit(
-                source=doc["source"],
-                court_key=doc["courtKey"],
-                hearing_date=doc.get("hearingDate") or hearing_date,
-                list_type=doc["listType"],
-                bench_label=doc.get("benchLabel") or "",
-                external_id=doc.get("externalId") or "",
-            )
-            if unit:
-                all_items.extend(list_items_for_document(unit["_id"]))
+        # Step 3: notify only newly created CauseListItems (different list even with case number → new item).
+        created_items = list(mongo.get("created_items") or [])
         log.info(
-            "notify start (checksum changed) court=%s items=%s",
+            "notify start (checksum changed) court=%s created_items=%s",
             court_key,
-            len(all_items),
+            len(created_items),
         )
-        notify = match_and_notify_items(all_items, court_key=court_key)
+        notify = match_and_notify_items(created_items, court_key=court_key)
 
         bump = bump_parsed(court=court_key, date=hearing_date, failed=False)
         log.info(
@@ -820,17 +807,8 @@ def _upsert_html_documents_with_checksum_gate(
     if to_upsert:
         mongo = upsert_main_output({**main_output, "documents": to_upsert})
         log.info("html mongo upsert result=%s", mongo)
-        for doc in to_upsert:
-            unit = find_cause_list_unit(
-                source=str(doc.get("source") or COURT_SOURCE[court_key]),
-                court_key=str(doc.get("courtKey") or court_key),
-                hearing_date=doc.get("hearingDate") or hearing_fallback,
-                list_type=str(doc.get("listType") or "main"),
-                bench_label=str(doc.get("benchLabel") or ""),
-                external_id=str(doc.get("externalId") or ""),
-            )
-            if unit:
-                notify_items.extend(list_items_for_document(unit["_id"]))
+        # Written units: notify only newly created items (Step 3).
+        notify_items.extend(list(mongo.get("created_items") or []))
         mongo = {
             **mongo,
             "documents_unchanged": unchanged,
@@ -841,6 +819,7 @@ def _upsert_html_documents_with_checksum_gate(
             "status": "checksum_unchanged",
             "documents_unchanged": unchanged,
             "documents_written": 0,
+            "created_items": [],
         }
 
     log.info(

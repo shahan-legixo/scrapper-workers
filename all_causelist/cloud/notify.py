@@ -27,66 +27,95 @@ def post_cause_list_notify(
     item_id: str,
     tracking_ids: list[str],
 ) -> dict[str, Any]:
-    """POST { itemId, trackingIds } with X-Internal-Token. Failures logged; never raise."""
-    url = notify_url()
-    if not url:
-        log.info("notify SKIP no CAUSE_LIST_NOTIFY_URL itemId=%s", item_id)
-        return {"status": "skipped_no_url", "itemId": item_id}
+    """Legacy single-item helper → batch shape (created bucket)."""
     if not tracking_ids:
         log.info("notify SKIP no trackingIds itemId=%s", item_id)
         return {"status": "skipped_no_tracking", "itemId": item_id}
+    return post_cause_list_notify_batch(
+        {
+            "createdTrackingIds": [
+                {"itemId": item_id, "trackingIds": list(tracking_ids)}
+            ],
+            "updatedTrackingIds": [],
+        }
+    )
+
+
+def post_cause_list_notify_batch(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST created/updated notify pairs. Failures logged; never raise.
+    """
+    created = list(payload.get("createdTrackingIds") or [])
+    updated = list(payload.get("updatedTrackingIds") or [])
+
+    url = notify_url()
+    if not url:
+        return {
+            "status": "skipped_no_url",
+            "createdTrackingIds": 0,
+            "updatedTrackingIds": 0,
+        }
+    if not created and not updated:
+        log.info("notify SKIP empty createdTrackingIds/updatedTrackingIds")
+        return {
+            "status": "skipped_no_tracking",
+            "createdTrackingIds": 0,
+            "updatedTrackingIds": 0,
+        }
 
     token = notify_internal_token()
     if not token:
         log.info(
-            "notify SKIP no LEX_INTERNAL_SERVICE_TOKEN itemId=%s",
-            item_id,
+            "notify SKIP no LEX_INTERNAL_SERVICE_TOKEN "
+            "createdTrackingIds=%s updatedTrackingIds=%s",
+            len(created),
+            len(updated),
         )
-        return {"status": "skipped_no_token", "itemId": item_id}
+        return {
+            "status": "skipped_no_token",
+            "createdTrackingIds": 0,
+            "updatedTrackingIds": 0,
+        }
 
-    body = {"itemId": item_id, "trackingIds": list(tracking_ids)}
+    body = {
+        "createdTrackingIds": created,
+        "updatedTrackingIds": updated,
+    }
     headers = {
         "Content-Type": "application/json",
         "X-Internal-Token": token,
     }
     log.info(
-        "notify request itemId=%s tracking_count=%s url=%s",
-        item_id,
-        len(tracking_ids),
+        "notify batch request createdTrackingIds=%s updatedTrackingIds=%s url=%s",
+        len(created),
+        len(updated),
         url,
     )
     try:
         response = httpx.post(url, json=body, headers=headers, timeout=20.0)
         if response.status_code >= 400:
-            log.warning(
-                "notify HTTP %s itemId=%s tracking=%s body=%s",
-                response.status_code,
-                item_id,
-                tracking_ids,
-                (response.text or "")[:200],
-            )
             return {
                 "status": "http_error",
-                "itemId": item_id,
                 "http_status": response.status_code,
+                "createdTrackingIds": len(created),
+                "updatedTrackingIds": len(updated),
             }
-        log.info(
-            "notify OK itemId=%s http=%s tracking_count=%s",
-            item_id,
-            response.status_code,
-            len(tracking_ids),
-        )
         return {
             "status": "ok",
-            "itemId": item_id,
             "http_status": response.status_code,
-            "tracking_count": len(tracking_ids),
+            "createdTrackingIds": len(created),
+            "updatedTrackingIds": len(updated),
         }
     except Exception as exc:  # noqa: BLE001 — must not fail scrape
         log.warning(
-            "notify failed itemId=%s tracking=%s error=%s",
-            item_id,
-            tracking_ids,
+            "notify batch failed createdTrackingIds=%s "
+            "updatedTrackingIds=%s error=%s",
+            len(created),
+            len(updated),
             exc,
         )
-        return {"status": "error", "itemId": item_id, "error": str(exc)}
+        return {
+            "status": "error",
+            "error": str(exc),
+            "createdTrackingIds": len(created),
+            "updatedTrackingIds": len(updated),
+        }

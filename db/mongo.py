@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from bson import ObjectId
-from pymongo import MongoClient, UpdateOne
+from pymongo import InsertOne, MongoClient, UpdateOne
 from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
 
@@ -165,6 +165,7 @@ def _result(status: str, **counts: Any) -> dict[str, Any]:
         "documents_upserted": 0,
         "items_upserted": 0,
         "created_items": [],
+        "updated_items": [],
         "collection": f"{_CAUSE_LIST}+{_CAUSE_LIST_ITEM}",
     }
     base.update(counts)
@@ -481,61 +482,107 @@ def match_tracking_ids_for_item(
     return tracking_ids
 
 
-def match_and_notify_items(
+def _notify_pairs_for_items(
     items: list[dict[str, Any]],
     *,
     court_key: str,
-) -> dict[str, Any]:
-    """For each item: match tracking → fingerprint gate → POST notify. Never raises."""
-    from all_causelist.cloud.notify import post_cause_list_notify
-
-    log.info("notify loop START court=%s items=%s", court_key, len(items))
-    matched_items = 0
-    notify_ok = 0
-    notify_fail = 0
-    notify_skip = 0
+) -> list[dict[str, Any]]:
+    """Match tracking for each item; omit entries with no trackingIds."""
+    pairs: list[dict[str, Any]] = []
     for item in items:
         if not item.get("_id"):
             continue
         tracking_ids = match_tracking_ids_for_item(item, court_key=court_key)
         if not tracking_ids:
-            # Identity miss, no fingerprint, or all trackings already alerted.
-            notify_skip += 1
             continue
-        matched_items += 1
-        fp = str(item.get("fingerprint") or "")[:16]
-        log.info(
-            "notify POST court=%s itemId=%s fp=%s... trackingIds=%s",
-            court_key,
-            item["_id"],
-            fp or "-",
-            tracking_ids,
+        pairs.append(
+            {
+                "itemId": str(item["_id"]),
+                "trackingIds": tracking_ids,
+            }
         )
-        result = post_cause_list_notify(
-            item_id=str(item["_id"]),
-            tracking_ids=tracking_ids,
-        )
-        status = result.get("status")
-        if status == "ok":
-            notify_ok += 1
-        elif status in ("skipped_no_url", "skipped_no_tracking", "skipped_no_token"):
-            notify_skip += 1
-            log.info(
-                "notify SKIPPED status=%s itemId=%s",
-                status,
-                item["_id"],
-            )
-        else:
-            notify_fail += 1
-    summary = {
-        "item_count": len(items),
-        "matched_items": matched_items,
-        "notify_ok": notify_ok,
-        "notify_fail": notify_fail,
-        "notify_skip": notify_skip,
+    return pairs
+
+
+def build_notify_batches(
+    created_items: list[dict[str, Any]] | None,
+    updated_items: list[dict[str, Any]] | None,
+    *,
+    court_key: str,
+) -> dict[str, Any]:
+    """Build notify payload: created/updated [{itemId, trackingIds}, ...]."""
+    return {
+        "createdTrackingIds": _notify_pairs_for_items(
+            list(created_items or []), court_key=court_key
+        ),
+        "updatedTrackingIds": _notify_pairs_for_items(
+            list(updated_items or []), court_key=court_key
+        ),
     }
-    log.info("notify loop DONE court=%s %s", court_key, summary)
+
+
+def match_and_notify_created_updated(
+    created_items: list[dict[str, Any]] | None,
+    updated_items: list[dict[str, Any]] | None,
+    *,
+    court_key: str,
+) -> dict[str, Any]:
+    """Match tracking for created/updated items → one batch POST. Never raises."""
+    from all_causelist.cloud.notify import post_cause_list_notify_batch
+
+    batches = build_notify_batches(
+        created_items, updated_items, court_key=court_key
+    )
+    created_n = len(batches["createdTrackingIds"])
+    updated_n = len(batches["updatedTrackingIds"])
+    log.info(
+        "notify batch START court=%s createdTrackingIds=%s updatedTrackingIds=%s",
+        court_key,
+        created_n,
+        updated_n,
+    )
+    result = post_cause_list_notify_batch(batches)
+    status = str(result.get("status") or "")
+    summary = {
+        **result,
+        "created_pairs": created_n,
+        "updated_pairs": updated_n,
+        "matched_items": created_n + updated_n,
+        "notify_ok": int(status == "ok"),
+        "notify_fail": int(status in ("http_error", "error")),
+        "notify_skip": int(status.startswith("skipped_")),
+        "batches": batches,
+    }
+    log.info(
+        "notify batch DONE court=%s %s",
+        court_key,
+        {
+            k: summary[k]
+            for k in (
+                "status",
+                "created_pairs",
+                "updated_pairs",
+                "notify_ok",
+                "notify_fail",
+                "notify_skip",
+            )
+            if k in summary
+        },
+    )
     return summary
+
+
+def match_and_notify_items(
+    items: list[dict[str, Any]],
+    *,
+    court_key: str,
+) -> dict[str, Any]:
+    """Rematch path: treat items as updated (no creates). Never raises."""
+    return match_and_notify_created_updated(
+        created_items=[],
+        updated_items=items,
+        court_key=court_key,
+    )
 
 
 def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
@@ -570,11 +617,14 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
 
         docs_upserted = 0
         docs_modified = 0
-        items_upserted = 0
+        items_inserted = 0
         items_modified = 0
         items_matched = 0
+        items_unchanged = 0
         items_skipped_no_fp = 0
-        item_ops: list[UpdateOne] = []
+        item_ops: list[InsertOne | UpdateOne] = []
+        created_ids: list[ObjectId] = []
+        updated_ids: list[ObjectId] = []
 
         tracked_keys = load_enabled_cause_list_tracking_keys(court_key)
         documents, items_in, items_kept = filter_documents_to_tracked(
@@ -619,7 +669,7 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 (str(checksum)[:16] + "...") if checksum else "-",
                 len(doc.get("items") or []),
             )
-            # Parent board upserted (reuse documentId for same date/list/bench).
+            # Parent: match list key → reuse _id; missing → create (upsert=True).
             res = docs_coll.update_one(
                 filt,
                 {"$set": fields, "$setOnInsert": {"createdAt": now}},
@@ -640,19 +690,31 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 if not isinstance(item, dict) or not item.get("fingerprint"):
                     items_skipped_no_fp += 1
                     continue
-                # Match documentId + identities: same list → update; other list
-                # (e.g. supplementary) has a different documentId → insert new.
-                item_fields = _item_set(item, document_id, hearing, now)
-                item_ops.append(
-                    UpdateOne(
-                        _item_upsert_filter(item, document_id),
-                        {
-                            "$set": item_fields,
-                            "$setOnInsert": {"createdAt": now},
-                        },
-                        upsert=True,
-                    )
+                # No item upsert=True: find by documentId+identities, then
+                # missing → InsertOne; same fp → skip; different fp → UpdateOne.
+                item_filt = _item_upsert_filter(item, document_id)
+                existing_item = items_coll.find_one(
+                    item_filt, {"_id": 1, "fingerprint": 1}
                 )
+                item_fields = _item_set(item, document_id, hearing, now)
+                incoming_fp = str(item.get("fingerprint") or "").strip()
+                if existing_item is None:
+                    new_id = ObjectId()
+                    item_fields["_id"] = new_id
+                    item_fields["createdAt"] = now
+                    item_ops.append(InsertOne(item_fields))
+                    created_ids.append(new_id)
+                elif str(existing_item.get("fingerprint") or "").strip() == incoming_fp:
+                    items_unchanged += 1
+                else:
+                    updated_ids.append(existing_item["_id"])
+                    item_ops.append(
+                        UpdateOne(
+                            {"_id": existing_item["_id"]},
+                            {"$set": item_fields},
+                            upsert=False,
+                        )
+                    )
 
         if items_skipped_no_fp:
             log.warning(
@@ -661,16 +723,13 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 court_key,
             )
 
-        created_ids: list[ObjectId] = []
         if item_ops:
             chunk = 500
             for i in range(0, len(item_ops), chunk):
                 bulk = items_coll.bulk_write(item_ops[i : i + chunk], ordered=False)
-                items_upserted += bulk.upserted_count
+                items_inserted += int(getattr(bulk, "inserted_count", 0) or 0)
                 items_modified += bulk.modified_count
                 items_matched += bulk.matched_count
-                for oid in (bulk.upserted_ids or {}).values():
-                    created_ids.append(oid)
             sample_fps = []
             for doc in documents:
                 for item in doc.get("items") or []:
@@ -681,28 +740,32 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 if len(sample_fps) >= 3:
                     break
             log.info(
-                "upsert CauseListItem ops=%s upserted=%s modified=%s sample_fp=%s",
+                "write CauseListItem ops=%s inserted=%s modified=%s "
+                "unchanged=%s sample_fp=%s",
                 len(item_ops),
-                items_upserted,
+                items_inserted,
                 items_modified,
+                items_unchanged,
                 sample_fps or "-",
             )
 
         created_items: list[dict[str, Any]] = []
         if created_ids:
-            created_items = list(
-                items_coll.find({"_id": {"$in": created_ids}})
-            )
-    
+            created_items = list(items_coll.find({"_id": {"$in": created_ids}}))
+        updated_items: list[dict[str, Any]] = []
+        if updated_ids:
+            updated_items = list(items_coll.find({"_id": {"$in": updated_ids}}))
+
         result = _result(
             "ok",
-            upserted=docs_upserted + items_upserted,
+            upserted=docs_upserted + items_inserted,
             modified=docs_modified + items_modified,
             matched=items_matched,
             documents_upserted=docs_upserted,
             documents_modified=docs_modified,
-            items_upserted=items_upserted,
+            items_inserted=items_inserted,
             items_modified=items_modified,
+            items_unchanged=items_unchanged,
             items_in=items_in,
             items_kept=items_kept,
             items_discarded=items_discarded,
@@ -718,14 +781,7 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(d, dict)
             ),
             created_items=created_items,
-        )
-        log.info(
-            "upsert DONE court=%s status=%s docs_up=%s items_up=%s created=%s",
-            court_key,
-            result.get("status"),
-            docs_upserted,
-            items_upserted,
-            len(created_items),
+            updated_items=updated_items,
         )
         return result
     except (PyMongoError, ValueError, KeyError) as exc:

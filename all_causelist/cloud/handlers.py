@@ -37,6 +37,7 @@ if str(_ROOT) not in sys.path:
 from db.mongo import (  # noqa: E402
     find_cause_list_unit,
     list_items_for_document,
+    match_and_notify_created_updated,
     match_and_notify_items,
     upsert_main_output,
 )
@@ -375,14 +376,21 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
         mongo = upsert_main_output(main)
         log.info("mongo upsert after checksum change result=%s", mongo)
 
-        # Step 3: notify only newly created CauseListItems (different list even with case number → new item).
+        # Step 3: batch notify created + fingerprint-updated items.
         created_items = list(mongo.get("created_items") or [])
+        updated_items = list(mongo.get("updated_items") or [])
         log.info(
-            "notify start (checksum changed) court=%s created_items=%s",
+            "notify start (checksum changed) court=%s created_items=%s "
+            "updated_items=%s",
             court_key,
             len(created_items),
+            len(updated_items),
         )
-        notify = match_and_notify_items(created_items, court_key=court_key)
+        notify = match_and_notify_created_updated(
+            created_items,
+            updated_items,
+            court_key=court_key,
+        )
 
         bump = bump_parsed(court=court_key, date=hearing_date, failed=False)
         log.info(
@@ -765,7 +773,7 @@ def _upsert_html_documents_with_checksum_gate(
 
     hearing_fallback = str(main_output.get("hearingDate") or "")
     to_upsert: list[dict[str, Any]] = []
-    notify_items: list[dict[str, Any]] = []
+    rematch_as_updated: list[dict[str, Any]] = []
     unchanged = 0
 
     for doc in documents:
@@ -794,7 +802,7 @@ def _upsert_html_documents_with_checksum_gate(
                 doc["externalId"],
                 str(sha)[:16],
             )
-            notify_items.extend(list_items_for_document(existing["_id"]))
+            rematch_as_updated.extend(list_items_for_document(existing["_id"]))
             continue
         log.info(
             "html checksum CHANGED/NEW externalId=%s incoming=%s... stored=%s... → upsert",
@@ -804,11 +812,13 @@ def _upsert_html_documents_with_checksum_gate(
         )
         to_upsert.append(doc)
 
+    created_items: list[dict[str, Any]] = []
+    updated_items: list[dict[str, Any]] = list(rematch_as_updated)
     if to_upsert:
         mongo = upsert_main_output({**main_output, "documents": to_upsert})
         log.info("html mongo upsert result=%s", mongo)
-        # Written units: notify only newly created items (Step 3).
-        notify_items.extend(list(mongo.get("created_items") or []))
+        created_items = list(mongo.get("created_items") or [])
+        updated_items.extend(list(mongo.get("updated_items") or []))
         mongo = {
             **mongo,
             "documents_unchanged": unchanged,
@@ -820,16 +830,23 @@ def _upsert_html_documents_with_checksum_gate(
             "documents_unchanged": unchanged,
             "documents_written": 0,
             "created_items": [],
+            "updated_items": [],
         }
 
     log.info(
-        "notify start (html) court=%s items=%s unchanged_docs=%s written_docs=%s",
+        "notify start (html) court=%s created_items=%s updated_items=%s "
+        "unchanged_docs=%s written_docs=%s",
         court_key,
-        len(notify_items),
+        len(created_items),
+        len(updated_items),
         unchanged,
         len(to_upsert),
     )
-    notify = match_and_notify_items(notify_items, court_key=court_key)
+    notify = match_and_notify_created_updated(
+        created_items,
+        updated_items,
+        court_key=court_key,
+    )
     log.info(
         "html checksum gate court=%s unchanged=%s written=%s notify=%s",
         court_key,

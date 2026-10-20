@@ -367,10 +367,10 @@ class NotifyClientTests(unittest.TestCase):
         self.assertEqual(
             kwargs["json"],
             {
-                "createdTrackingIds": [
+                "createdListItems": [
                     {"itemId": item_id, "trackingIds": [tracking_id]}
                 ],
-                "updatedTrackingIds": [],
+                "updatedListItems": [],
             },
         )
         self.assertEqual(kwargs["headers"]["Content-Type"], "application/json")
@@ -387,10 +387,10 @@ class NotifyClientTests(unittest.TestCase):
         mock_response.status_code = 200
         mock_response.text = ""
         payload = {
-            "createdTrackingIds": [
+            "createdListItems": [
                 {"itemId": created_item, "trackingIds": [tid]}
             ],
-            "updatedTrackingIds": [
+            "updatedListItems": [
                 {"itemId": updated_item, "trackingIds": [tid]}
             ],
         }
@@ -1166,9 +1166,9 @@ class TrackedItemFilterTests(unittest.TestCase):
         self.assertEqual(summary["created_pairs"], 0)
         post.assert_called_once()
         body = post.call_args.args[0]
-        self.assertEqual(body["createdTrackingIds"], [])
+        self.assertEqual(body["createdListItems"], [])
         self.assertEqual(
-            body["updatedTrackingIds"],
+            body["updatedListItems"],
             [
                 {
                     "itemId": str(supp_item["_id"]),
@@ -1210,11 +1210,11 @@ class TrackedItemFilterTests(unittest.TestCase):
                 [created], [updated], court_key="dlhc"
             )
         self.assertEqual(
-            batches["createdTrackingIds"],
+            batches["createdListItems"],
             [{"itemId": str(created["_id"]), "trackingIds": [str(tid)]}],
         )
         self.assertEqual(
-            batches["updatedTrackingIds"],
+            batches["updatedListItems"],
             [{"itemId": str(updated["_id"]), "trackingIds": [str(tid)]}],
         )
 

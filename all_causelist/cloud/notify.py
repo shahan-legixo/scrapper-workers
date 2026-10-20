@@ -33,10 +33,10 @@ def post_cause_list_notify(
         return {"status": "skipped_no_tracking", "itemId": item_id}
     return post_cause_list_notify_batch(
         {
-            "createdTrackingIds": [
+            "createdListItems": [
                 {"itemId": item_id, "trackingIds": list(tracking_ids)}
             ],
-            "updatedTrackingIds": [],
+            "updatedListItems": [],
         }
     )
 
@@ -44,48 +44,48 @@ def post_cause_list_notify(
 def post_cause_list_notify_batch(payload: dict[str, Any]) -> dict[str, Any]:
     """POST created/updated notify pairs. Failures logged; never raise.
     """
-    created = list(payload.get("createdTrackingIds") or [])
-    updated = list(payload.get("updatedTrackingIds") or [])
+    created = list(payload.get("createdListItems") or [])
+    updated = list(payload.get("updatedListItems") or [])
 
     url = notify_url()
     if not url:
         return {
             "status": "skipped_no_url",
-            "createdTrackingIds": 0,
-            "updatedTrackingIds": 0,
+            "createdListItems": 0,
+            "updatedListItems": 0,
         }
     if not created and not updated:
-        log.info("notify SKIP empty createdTrackingIds/updatedTrackingIds")
+        log.info("notify SKIP empty createdListItems/updatedListItems")
         return {
             "status": "skipped_no_tracking",
-            "createdTrackingIds": 0,
-            "updatedTrackingIds": 0,
+            "createdListItems": 0,
+            "updatedListItems": 0,
         }
 
     token = notify_internal_token()
     if not token:
         log.info(
             "notify SKIP no LEX_INTERNAL_SERVICE_TOKEN "
-            "createdTrackingIds=%s updatedTrackingIds=%s",
+            "createdListItems=%s updatedListItems=%s",
             len(created),
             len(updated),
         )
         return {
             "status": "skipped_no_token",
-            "createdTrackingIds": 0,
-            "updatedTrackingIds": 0,
+            "createdListItems": 0,
+            "updatedListItems": 0,
         }
 
     body = {
-        "createdTrackingIds": created,
-        "updatedTrackingIds": updated,
+        "createdListItems": created,
+        "updatedListItems": updated,
     }
     headers = {
         "Content-Type": "application/json",
         "X-Internal-Token": token,
     }
     log.info(
-        "notify batch request createdTrackingIds=%s updatedTrackingIds=%s url=%s",
+        "notify batch request createdListItems=%s updatedListItems=%s url=%s",
         len(created),
         len(updated),
         url,
@@ -96,19 +96,19 @@ def post_cause_list_notify_batch(payload: dict[str, Any]) -> dict[str, Any]:
             return {
                 "status": "http_error",
                 "http_status": response.status_code,
-                "createdTrackingIds": len(created),
-                "updatedTrackingIds": len(updated),
+                "createdListItems": len(created),
+                "updatedListItems": len(updated),
             }
         return {
             "status": "ok",
             "http_status": response.status_code,
-            "createdTrackingIds": len(created),
-            "updatedTrackingIds": len(updated),
+            "createdListItems": len(created),
+            "updatedListItems": len(updated),
         }
     except Exception as exc:  # noqa: BLE001 — must not fail scrape
         log.warning(
-            "notify batch failed createdTrackingIds=%s "
-            "updatedTrackingIds=%s error=%s",
+            "notify batch failed createdListItems=%s "
+            "updatedListItems=%s error=%s",
             len(created),
             len(updated),
             exc,
@@ -116,6 +116,6 @@ def post_cause_list_notify_batch(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "status": "error",
             "error": str(exc),
-            "createdTrackingIds": len(created),
-            "updatedTrackingIds": len(updated),
+            "createdListItems": len(created),
+            "updatedListItems": len(updated),
         }

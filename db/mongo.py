@@ -512,10 +512,10 @@ def build_notify_batches(
 ) -> dict[str, Any]:
     """Build notify payload: created/updated [{itemId, trackingIds}, ...]."""
     return {
-        "createdTrackingIds": _notify_pairs_for_items(
+        "createdListItems": _notify_pairs_for_items(
             list(created_items or []), court_key=court_key
         ),
-        "updatedTrackingIds": _notify_pairs_for_items(
+        "updatedListItems": _notify_pairs_for_items(
             list(updated_items or []), court_key=court_key
         ),
     }
@@ -533,10 +533,10 @@ def match_and_notify_created_updated(
     batches = build_notify_batches(
         created_items, updated_items, court_key=court_key
     )
-    created_n = len(batches["createdTrackingIds"])
-    updated_n = len(batches["updatedTrackingIds"])
+    created_n = len(batches["createdListItems"])
+    updated_n = len(batches["updatedListItems"])
     log.info(
-        "notify batch START court=%s createdTrackingIds=%s updatedTrackingIds=%s",
+        "notify batch START court=%s createdListItems=%s updatedListItems=%s",
         court_key,
         created_n,
         updated_n,

@@ -7,7 +7,7 @@ Local-first defaults:
 Collections (fixed):
   causelists
   causelistitems
-  casealerttracking
+  casealerttrackings
 
 Set MONGO_URI= (empty) to disable sync without removing code.
 """
@@ -50,7 +50,10 @@ _CAUSE_LIST_ITEM = (
     or os.environ.get("MONGO_CAUSE_LIST_ITEM_COLLECTION")
     or "causelistitems"
 ).strip()
-_CASE_ALERT_TRACKING = "casealerttracking"
+_CASE_ALERT_TRACKING = (
+    os.environ.get("MONGO_CASE_ALERT_TRACKING_COLLECTION")
+    or "casealerttrackings"
+).strip()
 
 _client: MongoClient | None = None
 _indexes_ready = False

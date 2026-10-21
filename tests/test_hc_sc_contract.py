@@ -1137,6 +1137,199 @@ class TrackedItemFilterTests(unittest.TestCase):
         self.assertEqual(main_items[0]["documentId"], main_parent["_id"])
         self.assertEqual(main_items[0]["identities"], identities)
 
+    def test_sci_same_fingerprint_same_document_skips_item_write(self) -> None:
+        """SCI: same CauseList + same item fp → no CauseListItem insert/update."""
+        import db.mongo as mongo
+        from pymongo import InsertOne, UpdateOne
+
+        from all_causelist.all_schemas.schema import make_cause_list_item
+        from all_causelist.supreme_schema import court_no_from_label
+
+        def _path_get(doc: dict, path: str):
+            cur: object = doc
+            for part in path.split("."):
+                if not isinstance(cur, dict) or part not in cur:
+                    return None
+                cur = cur[part]
+            return cur
+
+        def _matches(doc: dict, filt: dict) -> bool:
+            for key, val in filt.items():
+                got = _path_get(doc, key) if "." in key else doc.get(key)
+                if got != val:
+                    return False
+            return True
+
+        class _FakeColl:
+            def __init__(self) -> None:
+                self.docs: list[dict] = []
+                self.bulk_calls = 0
+
+            def update_one(self, filt, update, upsert=False):
+                for doc in self.docs:
+                    if _matches(doc, filt):
+                        before = dict(doc)
+                        doc.update(update.get("$set") or {})
+                        res = MagicMock()
+                        res.upserted_id = None
+                        res.modified_count = 1 if doc != before else 0
+                        return res
+                if not upsert:
+                    res = MagicMock()
+                    res.upserted_id = None
+                    res.modified_count = 0
+                    return res
+                new_id = ObjectId()
+                row: dict = {"_id": new_id}
+                row.update(update.get("$set") or {})
+                for k, v in (update.get("$setOnInsert") or {}).items():
+                    row.setdefault(k, v)
+                for k, v in filt.items():
+                    if "." not in k:
+                        row.setdefault(k, v)
+                self.docs.append(row)
+                res = MagicMock()
+                res.upserted_id = new_id
+                res.modified_count = 0
+                return res
+
+            def find_one(self, filt, projection=None):
+                for doc in self.docs:
+                    if _matches(doc, filt):
+                        if projection:
+                            return {k: doc[k] for k in projection if k in doc}
+                        return dict(doc)
+                return None
+
+            def find(self, filt, projection=None):
+                id_clause = filt.get("_id") if isinstance(filt, dict) else None
+                if isinstance(id_clause, dict) and "$in" in id_clause:
+                    wanted = set(id_clause["$in"])
+                    return [dict(d) for d in self.docs if d["_id"] in wanted]
+                return [dict(d) for d in self.docs if _matches(d, filt)]
+
+            def bulk_write(self, ops, ordered=False):
+                self.bulk_calls += 1
+                inserted = 0
+                modified = 0
+                matched = 0
+                for op in ops:
+                    if isinstance(op, InsertOne):
+                        doc = dict(op._doc)
+                        doc.setdefault("_id", ObjectId())
+                        self.docs.append(doc)
+                        inserted += 1
+                        continue
+                    if not isinstance(op, UpdateOne):
+                        raise TypeError(type(op))
+                    if op._upsert:
+                        raise AssertionError("item UpdateOne must not use upsert=True")
+                    filt = op._filter
+                    update = op._doc
+                    found = next(
+                        (d for d in self.docs if _matches(d, filt)), None
+                    )
+                    if found is None:
+                        raise AssertionError("UpdateOne with no match")
+                    matched += 1
+                    found.update(update.get("$set") or {})
+                    modified += 1
+                res = MagicMock()
+                res.inserted_count = inserted
+                res.modified_count = modified
+                res.matched_count = matched
+                return res
+
+        court_no = court_no_from_label("COURT NO. : 5")
+        item = make_cause_list_item(
+            hearing_date="2026-10-21",
+            case_numbers="SLP(C) No. 37476/2026",
+            party=(
+                "YUVAJANA SRAMIKA RYTHU CONGRESS PARTY VS "
+                "THE STATE OF ANDHRA PRADESH AND ORS."
+            ),
+            judges=[
+                "HON'BLE MR. JUSTICE JOYMALYA BAGCHI",
+                "HON'BLE MRS. JUSTICE V. MOHANA",
+            ],
+            listing_no=1,
+            listing_section="[FRESH (FOR ADMISSION) - CIVIL CASES]",
+            purpose="FOR ADMISSION",
+            court_no=court_no,
+            bench="main",
+            court_name_value="Supreme Court of India",
+            list_type="miscellaneous",
+        )
+        self.assertEqual(item.get("courtNo"), "5")
+        self.assertTrue(item.get("fingerprint"))
+
+        idn = item["identities"]
+        tracked = {
+            (
+                str(idn["caseType"]).upper(),
+                str(idn["rootCaseNumber"]),
+                str(idn["caseYear"]),
+            )
+        }
+        board = {
+            "source": "supreme",
+            "courtKey": "sci",
+            "courtLevel": "supreme_court",
+            "hearingDate": "2026-10-21",
+            "listType": "miscellaneous",
+            "benchLabel": "main",
+            "externalId": "sci:2026-10-21:miscellaneous:main",
+            "checksum": "chk-sci-same",
+            "items": [item],
+        }
+        payload = {
+            "courtKey": "sci",
+            "hearingDate": "2026-10-21",
+            "documents": [board],
+        }
+
+        fake_docs = _FakeColl()
+        fake_items = _FakeColl()
+        mock_db = MagicMock()
+        mock_db.client.admin.command.return_value = {"ok": 1}
+        mock_db.__getitem__.side_effect = lambda name: {
+            "causelists": fake_docs,
+            "causelistitems": fake_items,
+        }[name]
+
+        with patch.object(mongo, "mongo_uri", return_value="mongodb://test"):
+            with patch.object(mongo, "_db", return_value=mock_db):
+                with patch.object(
+                    mongo,
+                    "load_enabled_cause_list_tracking_keys",
+                    return_value=tracked,
+                ):
+                    first = mongo.upsert_main_output(payload)
+                    item_snapshot = [dict(d) for d in fake_items.docs]
+                    item_id = item_snapshot[0]["_id"]
+                    fp_before = item_snapshot[0]["fingerprint"]
+                    court_no_before = item_snapshot[0].get("courtNo")
+                    bulk_after_first = fake_items.bulk_calls
+                    second = mongo.upsert_main_output(payload)
+
+        self.assertEqual(first["status"], "ok", first)
+        self.assertEqual(first["items_inserted"], 1)
+        self.assertEqual(len(first["created_items"]), 1)
+        self.assertEqual(court_no_before, "5")
+
+        self.assertEqual(second["status"], "ok", second)
+        self.assertEqual(second["items_inserted"], 0, second)
+        self.assertEqual(second["items_modified"], 0, second)
+        self.assertEqual(second["items_unchanged"], 1, second)
+        self.assertEqual(second["created_items"], [])
+        self.assertEqual(second["updated_items"], [])
+        # No second bulk_write when nothing changed
+        self.assertEqual(fake_items.bulk_calls, bulk_after_first)
+        self.assertEqual(len(fake_items.docs), 1)
+        self.assertEqual(fake_items.docs[0]["_id"], item_id)
+        self.assertEqual(fake_items.docs[0]["fingerprint"], fp_before)
+        self.assertEqual(fake_items.docs[0].get("courtNo"), "5")
+
     def test_suppl_created_item_notifies_despite_prior_main_fingerprint(self) -> None:
         """Step 3: new list item is notified even if main already alerted same case."""
         import db.mongo as mongo

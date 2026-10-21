@@ -521,6 +521,54 @@ def build_notify_batches(
     }
 
 
+def mark_notified_tracking_fingerprints(
+    *,
+    items: list[dict[str, Any]],
+    batches: dict[str, Any],
+) -> int:
+    """After successful notify: set lastFingerprints.causeList per trackingId.
+    """
+    by_id = {
+        str(item["_id"]): item
+        for item in items
+        if isinstance(item, dict) and item.get("_id")
+    }
+    marked = 0
+    try:
+        for bucket in ("createdListItems", "updatedListItems"):
+            for entry in batches.get(bucket) or []:
+                if not isinstance(entry, dict):
+                    continue
+                item = by_id.get(str(entry.get("itemId") or ""))
+                if not item:
+                    continue
+                fp = str(item.get("fingerprint") or "").strip()
+                if not fp:
+                    continue
+                for tid in entry.get("trackingIds") or []:
+                    try:
+                        oid = ObjectId(str(tid))
+                    except Exception:  # noqa: BLE001
+                        continue
+                    res = db[_CASE_ALERT_TRACKING].update_one(
+                        {"_id": oid},
+                        {"$set": {"lastFingerprints.causeList": fp}},
+                    )
+                    if res.matched_count:
+                        marked += 1
+                        log.info(
+                            "tracking lastFingerprints.causeList SET "
+                            "trackingId=%s itemId=%s fp=%s...",
+                            tid,
+                            entry.get("itemId"),
+                            fp[:16],
+                        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mark lastFingerprints failed error=%s", exc)
+        return marked
+    return marked
+
+
 def match_and_notify_created_updated(
     created_items: list[dict[str, Any]] | None,
     updated_items: list[dict[str, Any]] | None,
@@ -543,6 +591,12 @@ def match_and_notify_created_updated(
     )
     result = post_cause_list_notify_batch(batches)
     status = str(result.get("status") or "")
+    marked = 0
+    if status == "ok":
+        marked = mark_notified_tracking_fingerprints(
+            items=created_items + updated_items,
+            batches=batches,
+        )
     summary = {
         **result,
         "created_pairs": created_n,
@@ -551,6 +605,7 @@ def match_and_notify_created_updated(
         "notify_ok": int(status == "ok"),
         "notify_fail": int(status in ("http_error", "error")),
         "notify_skip": int(status.startswith("skipped_")),
+        "fingerprints_marked": marked,
         "batches": batches,
     }
     log.info(
@@ -565,6 +620,7 @@ def match_and_notify_created_updated(
                 "notify_ok",
                 "notify_fail",
                 "notify_skip",
+                "fingerprints_marked",
             )
             if k in summary
         },
@@ -694,10 +750,33 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 # missing → InsertOne; same fp → skip; different fp → UpdateOne.
                 item_filt = _item_upsert_filter(item, document_id)
                 existing_item = items_coll.find_one(
-                    item_filt, {"_id": 1, "fingerprint": 1}
+                    item_filt,
+                    {
+                        "_id": 1,
+                        "fingerprint": 1,
+                        "identities": 1,
+                        "courtNo": 1,
+                        "listingNo": 1,
+                        "listingSection": 1,
+                        "purpose": 1,
+                        "bench": 1,
+                        "judges": 1,
+                        "party": 1,
+                    },
                 )
                 item_fields = _item_set(item, document_id, hearing, now)
                 incoming_fp = str(item.get("fingerprint") or "").strip()
+                incoming_fields = {
+                    "fingerprint": incoming_fp,
+                    "identities": item.get("identities"),
+                    "courtNo": item.get("courtNo"),
+                    "listingNo": item.get("listingNo"),
+                    "listingSection": item.get("listingSection"),
+                    "purpose": item.get("purpose"),
+                    "bench": item.get("bench"),
+                    "judges": item.get("judges"),
+                    "party": item.get("party"),
+                }
                 if existing_item is None:
                     new_id = ObjectId()
                     item_fields["_id"] = new_id
@@ -707,6 +786,7 @@ def upsert_main_output(main_output: dict[str, Any]) -> dict[str, Any]:
                 elif str(existing_item.get("fingerprint") or "").strip() == incoming_fp:
                     items_unchanged += 1
                 else:
+                    db_fp = str(existing_item.get("fingerprint") or "").strip()
                     updated_ids.append(existing_item["_id"])
                     item_ops.append(
                         UpdateOne(

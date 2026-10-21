@@ -153,6 +153,26 @@ class PrintedCaseTypeTests(unittest.TestCase):
         self.assertEqual(item["identities"]["caseYear"], "1998")
 
 
+class SciCourtHeaderTests(unittest.TestCase):
+    def test_court_re_accepts_colon_variants(self) -> None:
+        from all_causelist.pdfLayout.supreme_pdf_layout import COURT_RE
+
+        for label in (
+            "COURT NO. : 5",
+            "COURT NO.:5",
+            "COURT NO. 5",
+            "COURT NO.5",
+            "Registrar Court No. : 2",
+        ):
+            self.assertTrue(COURT_RE.match(label), label)
+
+    def test_court_no_from_label_extracts_digit(self) -> None:
+        from all_causelist.supreme_schema import court_no_from_label
+
+        self.assertEqual(court_no_from_label("COURT NO. : 5"), "5")
+        self.assertEqual(court_no_from_label("COURT NO. 5"), "5")
+
+
 class ChecksumContractTests(unittest.TestCase):
     def test_byte_checksum_sha256_hex(self) -> None:
         raw = b"%PDF-1.4 fake"

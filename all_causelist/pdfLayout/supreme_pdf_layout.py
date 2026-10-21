@@ -31,8 +31,11 @@ HEADER_NOISE = re.compile(
     r"^NOTE\s*:-|^LISTING IS AUTOMATIC",
     re.I,
 )
+# PDF text often has a colon: "COURT NO. : 5" / "COURT NO.:5"
 COURT_RE = re.compile(
-    r"^(CHIEF JUSTICE'?S COURT|COURT\s*NO\.?\s*\d+|Registrar Court No\.?\s*\d+)$",
+    r"^(CHIEF JUSTICE'?S COURT|"
+    r"COURT\s*NO\.?\s*:?\s*\d+|"
+    r"Registrar Court No\.?\s*:?\s*\d+)$",
     re.I,
 )
 JUDGE_RE = re.compile(r"^HON[''`′]?BLE\b", re.I)

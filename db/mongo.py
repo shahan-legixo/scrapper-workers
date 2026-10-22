@@ -528,6 +528,9 @@ def mark_notified_tracking_fingerprints(
 ) -> int:
     """After successful notify: set lastFingerprints.causeList per trackingId.
     """
+    db = _db()
+    if db is None:
+        return 0
     by_id = {
         str(item["_id"]): item
         for item in items

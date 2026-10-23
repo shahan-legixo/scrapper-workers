@@ -47,20 +47,24 @@ def run_delhi(cause_date: str, output_base: Path) -> dict[str, Any]:
         cause_date,
         on_progress=_progress("Delhi"),
     )
-    stem = out_dir / f"causelist-{cause_date}"
-    json_path = stem.with_suffix(".json")
-    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    from all_causelist.main_output import (
+        strip_raw_html_from_payload,
+        write_main_output_from_payload,
+    )
 
-    from all_causelist.main_output import write_main_output_from_payload
-  
-
-    #create main file ->will delete later
+    # mainOutput first (stamps HTML-byte checksum after parse); then JSON without rawHtml.
     main_path = write_main_output_from_payload(
         out_dir,
         "delhi",
         payload,
         cause_date=cause_date,
         court_name=payload.get("courtName"),
+    )
+    stem = out_dir / f"causelist-{cause_date}"
+    json_path = stem.with_suffix(".json")
+    json_path.write_text(
+        json.dumps(strip_raw_html_from_payload(payload), ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
     return {

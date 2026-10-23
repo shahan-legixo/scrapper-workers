@@ -99,6 +99,8 @@ def fetch_telangana_cause_list(
                     list_date=display_date,
                     cause_date=cause_date,
                 )
+                # Full page HTML — CauseList.checksum = SHA-256 of these bytes after parse.
+                parsed["rawHtml"] = html
                 results.append(parsed)
             except (httpx.HTTPError, TelanganaCauseListError) as exc:
                 results.append(
@@ -351,7 +353,7 @@ def _to_display_date(value: str) -> str:
 
 def write_json(payload: dict, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    from .main_output import write_main_output_from_payload
+    from .main_output import strip_raw_html_from_payload, write_main_output_from_payload
 
     write_main_output_from_payload(
         output_dir,
@@ -361,5 +363,8 @@ def write_json(payload: dict, output_dir: Path) -> Path:
         court_name=payload.get("courtName") or COURT_NAME,
     )
     path = output_dir / f"causelist-{payload['date']}.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(strip_raw_html_from_payload(payload), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return path

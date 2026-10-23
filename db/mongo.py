@@ -197,6 +197,8 @@ def _parent_filter(doc: dict[str, Any], hearing: datetime) -> dict[str, Any]:
         "hearingDate": hearing,
         "listType": doc["listType"],
         "benchLabel": doc.get("benchLabel") or "",
+        "edition": doc.get("edition") or "",
+        "benchType": doc.get("benchType") or "",
         "externalId": doc.get("externalId") or "",
     }
 
@@ -209,6 +211,8 @@ def _parent_set(doc: dict[str, Any], hearing: datetime, now: datetime) -> dict[s
         "hearingDate": hearing,
         "listType": doc["listType"],
         "benchLabel": doc.get("benchLabel") or "",
+        "edition": doc.get("edition") or "",
+        "benchType": doc.get("benchType") or "",
         "checksum": doc["checksum"],
         "status": doc.get("status") or "ok",
         "externalId": doc.get("externalId") or "",
@@ -272,6 +276,8 @@ def find_cause_list_unit(
     list_type: str,
     bench_label: str,
     external_id: str,
+    edition: str = "",
+    bench_type: str = "",
 ) -> dict[str, Any] | None:
     """findOne CauseList by unit identity."""
     db = _db()
@@ -289,6 +295,8 @@ def find_cause_list_unit(
             "hearingDate": hearing,
             "listType": list_type,
             "benchLabel": bench_label or "",
+            "edition": edition or "",
+            "benchType": bench_type or "",
             "externalId": external_id or "",
         }
     )

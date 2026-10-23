@@ -12,6 +12,7 @@ from typing import Any
 from all_causelist.all_schemas.schema import (
     COURT_SOURCE,
     compute_checksum,
+    compute_parsed_unit_checksum,
     group_flat_cases_to_documents,
     make_external_id,
     normalize_list_type_enum,
@@ -225,75 +226,12 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
         else:
             raise ValueError("local_path or gcs_uri required to parse PDF")
 
-        sha = compute_checksum(pdf_bytes)
+        # Must parse first: CauseList.checksum = hash of all parsed fields (not PDF bytes).
         list_type_enum = normalize_list_type_enum(list_type)
         bench_label = (label or "").strip()
-        external_id = make_external_id(
-            court_key, hearing_date, list_type_enum, bench_label
-        )
         source = COURT_SOURCE[court_key]
 
-        existing = find_cause_list_unit(
-            source=source,
-            court_key=court_key,
-            hearing_date=hearing_date,
-            list_type=list_type_enum,
-            bench_label=bench_label,
-            external_id=external_id,
-        )
-        stored_sha = (existing or {}).get("checksum")
-        log.info(
-            "checksum compare court=%s externalId=%s incoming=%s... stored=%s... match=%s",
-            court_key,
-            external_id,
-            sha[:16],
-            (str(stored_sha)[:16] + "...") if stored_sha else "-",
-            bool(existing is not None and stored_sha == sha),
-        )
-
-        # Same unit + same PDF bytes → skip rewrite; still rematch + notify.
-        if existing is not None and existing.get("checksum") == sha:
-            items = list_items_for_document(existing["_id"])
-            log.info(
-                "checksum UNCHANGED → rematch+notify only court=%s docId=%s items=%s",
-                court_key,
-                existing["_id"],
-                len(items),
-            )
-            notify = match_and_notify_items(items, court_key=court_key)
-            bump = bump_parsed(court=court_key, date=hearing_date, failed=False)
-            log.info(
-                "parse SKIP rewrite checksum_unchanged court=%s items=%s notify=%s",
-                court_key,
-                len(items),
-                notify,
-            )
-            return {
-                "status": "ok",
-                "court": court_key,
-                "date": hearing_date,
-                "job_id": jid,
-                "gcs_uri": gcs_uri,
-                "checksum_unchanged": True,
-                "item_count": len(items),
-                "document_count": 1,
-                "mongodb": {
-                    "status": "checksum_unchanged",
-                    "document_id": str(existing["_id"]),
-                },
-                "notify": notify,
-                "job": bump,
-            }
-
-        log.info(
-            "checksum CHANGED/NEW → extract+upsert court=%s externalId=%s checksum=%s...",
-            court_key,
-            external_id,
-            sha[:16],
-        )
         log.info("parse extracting cases from PDF court=%s", court_key)
-
-        
         block = _cases_from_pdf_for_court(
             court_key,
             pdf_file,
@@ -304,8 +242,6 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
             extra=body,
         )
 
-
-        #it is extracting cases from pdf
         cases = list(block.get("cases") or [])
         for row in cases:
             row_bench = (
@@ -316,13 +252,19 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
                 {
                     "benchLabel": row_bench,
                     "list_type_display": block.get("list_type") or list_type,
+                    "edition": "",
+                    "benchType": "",
                     "externalId": make_external_id(
-                        court_key, hearing_date, list_type_enum, row_bench
+                        court_key,
+                        hearing_date,
+                        list_type_enum,
+                        row_bench,
+                        "",
+                        "",
                     ),
                     "source_url": source_url,
                     "rawRef": gcs_uri or None,
                     "contentType": "application/pdf" if gcs_uri else None,
-                    "checksum_raw": pdf_bytes,
                 },
             )
 
@@ -331,20 +273,78 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
             hearing_date=hearing_date,
             cases=cases,
         )
-        
 
-        #it is building main output
         for doc in documents:
             if gcs_uri:
                 doc["rawRef"] = gcs_uri
                 doc["contentType"] = "application/pdf"
-            doc["checksum"] = sha
+            doc.setdefault("edition", "")
+            doc.setdefault("benchType", "")
             doc["externalId"] = make_external_id(
                 court_key,
                 hearing_date,
                 doc.get("listType") or list_type_enum,
                 doc.get("benchLabel") or bench_label,
+                doc.get("edition") or "",
+                doc.get("benchType") or "",
             )
+            # After parse: checksum from all item fields of this unit.
+            doc["checksum"] = compute_parsed_unit_checksum(
+                court_key=court_key,
+                hearing_date=hearing_date,
+                list_type=doc.get("listType") or list_type_enum,
+                bench_label=doc.get("benchLabel") or bench_label,
+                items=list(doc.get("items") or []),
+                external_id=str(doc.get("externalId") or ""),
+                edition=str(doc.get("edition") or ""),
+                bench_type=str(doc.get("benchType") or ""),
+            )
+
+        # Same parsed fields → skip rewrite; still rematch + notify.
+        if len(documents) == 1:
+            doc0 = documents[0]
+            parsed_sha = str(doc0.get("checksum") or "")
+            external_id = str(doc0.get("externalId") or "")
+            existing = find_cause_list_unit(
+                source=source,
+                court_key=court_key,
+                hearing_date=hearing_date,
+                list_type=doc0.get("listType") or list_type_enum,
+                bench_label=doc0.get("benchLabel") or bench_label,
+                external_id=external_id,
+                edition=str(doc0.get("edition") or ""),
+                bench_type=str(doc0.get("benchType") or ""),
+            )
+            stored_sha = (existing or {}).get("checksum")
+            log.info(
+                "checksum compare (parsed fields) court=%s externalId=%s "
+                "incoming=%s... stored=%s... match=%s",
+                court_key,
+                external_id,
+                parsed_sha[:16] if parsed_sha else "-",
+                (str(stored_sha)[:16] + "...") if stored_sha else "-",
+                bool(existing is not None and stored_sha == parsed_sha),
+            )
+            if existing is not None and stored_sha == parsed_sha:
+                items = list_items_for_document(existing["_id"])
+                notify = match_and_notify_items(items, court_key=court_key)
+                bump = bump_parsed(court=court_key, date=hearing_date, failed=False)
+                return {
+                    "status": "ok",
+                    "court": court_key,
+                    "date": hearing_date,
+                    "job_id": jid,
+                    "gcs_uri": gcs_uri,
+                    "checksum_unchanged": True,
+                    "item_count": len(items),
+                    "document_count": 1,
+                    "mongodb": {
+                        "status": "checksum_unchanged",
+                        "document_id": str(existing["_id"]),
+                    },
+                    "notify": notify,
+                    "job": bump,
+                }
 
         main = build_main_output(
             court=court_key,
@@ -354,7 +354,6 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
         )
 
         fp_sample: list[str] = []
-        
         for doc in documents:
             for it in doc.get("items") or []:
                 if isinstance(it, dict) and it.get("fingerprint"):
@@ -364,19 +363,18 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
             if len(fp_sample) >= 3:
                 break
         log.info(
-            "fingerprint ready court=%s docs=%s items=%s sample_fp=%s",
+            "fingerprint ready court=%s docs=%s items=%s sample_fp=%s "
+            "parsed_checksum=%s...",
             court_key,
             len(documents),
             main.get("item_count"),
             fp_sample or "-",
+            (documents[0].get("checksum") or "-")[:16] if documents else "-",
         )
 
-
-        #it is upserting main output to mongodb
         mongo = upsert_main_output(main)
         log.info("mongo upsert after checksum change result=%s", mongo)
 
-        # Step 3: batch notify created + fingerprint-updated items.
         created_items = list(mongo.get("created_items") or [])
         updated_items = list(mongo.get("updated_items") or [])
         log.info(
@@ -399,7 +397,7 @@ def handle_parse(body: dict[str, Any]) -> dict[str, Any]:
             main.get("item_count"),
             main.get("document_count"),
             gcs_uri or "-",
-            sha[:16],
+            (documents[0].get("checksum") or "-")[:16] if documents else "-",
             notify,
         )
         return {
@@ -479,21 +477,57 @@ def _scrape_pdf_court(
     for i, item in enumerate(pdfs, start=1):
         list_enum = normalize_list_type_enum(item.get("list_type"))
         label = str(item.get("label") or "").strip()
+        # BMHC: object name = coram label (+ weekly tag when needed)
+        source_list = str(item.get("list_type") or "").strip()
+        gcs_filename = str(item.get("filename") or Path(item["pdf_path"]).name)
+        bench_for_unit = label
+        if court_key == "bmhc":
+            from all_causelist.cloud.gcs import bmhc_coram_pdf_filename
+
+            gcs_filename = bmhc_coram_pdf_filename(
+                label or str(item.get("coram_slug") or "") or gcs_filename,
+                source_list=source_list or None,
+            )
+            # Weekly Main - 1 vs - 5 — tag bench when source is a weekly link.
+            if (
+                list_enum == "weekly"
+                or source_list.casefold().startswith("weekly")
+            ) and source_list:
+                bench_for_unit = f"{label} [{source_list}]".strip() if label else source_list
+        local_pdf = Path(item["pdf_path"])
         log.info(
-            "pdf upload %s/%s file=%s list_type=%s",
+            "pdf upload %s/%s file=%s gcs_name=%s list_type=%s label=%s",
             i,
             len(pdfs),
-            Path(item["pdf_path"]).name,
+            local_pdf.name,
+            gcs_filename,
             list_enum,
+            (bench_for_unit or label)[:80],
         )
+        if not local_pdf.is_file():
+            log.warning(
+                "pdf upload SKIP missing local file court=%s path=%s "
+                "(duplicate coram row or earlier cleanup)",
+                court_key,
+                local_pdf,
+            )
+            uploads.append(
+                {
+                    "skipped_upload": True,
+                    "reason": "missing_local_file",
+                    "local_path": str(local_pdf),
+                    "gcs_uri": None,
+                }
+            )
+            continue
         up = _upload_pdf_unless_checksum_unchanged(
-            local_path=Path(item["pdf_path"]),
+            local_path=local_pdf,
             court_key=court_key,
             hearing_date=date,
             list_type=list_enum,
-            bench_label=label,
+            bench_label=bench_for_unit,
             source_url=item.get("source_url"),
-            filename=Path(item["pdf_path"]).name,
+            filename=gcs_filename,
         )
         log.info(
             "pdf upload result gcs_uri=%s skipped=%s dry_run=%s",
@@ -506,11 +540,14 @@ def _scrape_pdf_court(
         # Dry-run / LOCAL_INLINE_PARSE may still attach local_path for laptop tests.
         extra: dict[str, Any] = {
             "msb": item.get("msb"),
-            "filename": item.get("filename"),
+            "filename": gcs_filename,
+            "coram_index": item.get("coram_index"),
         }
         if config.cloud_dry_run() or config.local_inline_parse():
             extra["local_path"] = item["pdf_path"]
 
+        # Prefer site label (e.g. Weekly Main - 5) so enum+bench stay unique for weekly.
+        parse_list_type = source_list or list_enum
         if config.local_inline_parse():
             log.info("pdf inline parse %s/%s", i, len(pdfs))
             parsed = handle_parse(
@@ -518,10 +555,10 @@ def _scrape_pdf_court(
                     "job_id": jid,
                     "court": court_key,
                     "date": date,
-                    "list_type": list_enum,
+                    "list_type": parse_list_type,
                     "source_url": item.get("source_url") or "",
                     "gcs_uri": up["gcs_uri"],
-                    "label": label,
+                    "label": bench_for_unit,
                     **extra,
                 }
             )
@@ -537,10 +574,10 @@ def _scrape_pdf_court(
                 job_id=jid,
                 court=court_key,
                 date=date,
-                list_type=list_enum,
+                list_type=parse_list_type,
                 source_url=item.get("source_url") or "",
                 gcs_uri=up["gcs_uri"],
-                label=label,
+                label=bench_for_unit,
                 extra=extra,
             )
             log.info("pdf parse task result=%s", task.get("status") or task)
@@ -572,6 +609,10 @@ def _scrape_html_court(
     date: str,
     output_base: Path,
 ) -> dict[str, Any]:
+    # MPHC: stream one combo → checksum/upsert/notify → drop (no 36-in-memory).
+    if court_key == "mphc":
+        return _scrape_mphc_streaming(date=date)
+
     from run_all import (
         run_delhi,
         run_mphc,
@@ -695,52 +736,25 @@ def _upload_pdf_unless_checksum_unchanged(
     source_url: str | None,
     filename: str,
 ) -> dict[str, Any]:
-    """Skip GCS rewrite when CauseList unit already has the same PDF checksum."""
+    """Upload PDF to GCS for view/rawRef.
+
+    CauseList.checksum is **parsed fields** (set in parse job), so upload does not
+    gate on that checksum — always write/overwrite the object path for this unit.
+    """
     list_enum = normalize_list_type_enum(list_type)
     bench = (bench_label or "").strip()
-    external_id = make_external_id(court_key, hearing_date, list_enum, bench)
+    edition = ""
+    bench_type = ""
+    external_id = make_external_id(
+        court_key, hearing_date, list_enum, bench, edition, bench_type
+    )
     pdf_bytes = local_path.read_bytes()
-    sha = compute_checksum(pdf_bytes)
-    existing = find_cause_list_unit(
-        source=COURT_SOURCE[court_key],
-        court_key=court_key,
-        hearing_date=hearing_date,
-        list_type=list_enum,
-        bench_label=bench,
-        external_id=external_id,
-    )
-    stored_sha = (existing or {}).get("checksum")
-    same = bool(
-        existing is not None and stored_sha == sha and existing.get("rawRef")
-    )
+    file_sha = compute_checksum(pdf_bytes)
     log.info(
-        "checksum upload-gate court=%s externalId=%s incoming=%s... stored=%s... skip=%s",
+        "pdf upload WRITE court=%s externalId=%s file_sha=%s... (CauseList.checksum is parsed-fields, gated in parse)",
         court_key,
         external_id,
-        sha[:16],
-        (str(stored_sha)[:16] + "...") if stored_sha else "-",
-        same,
-    )
-    if same:
-        log.info(
-            "pdf upload SKIP checksum_unchanged court=%s externalId=%s rawRef=%s",
-            court_key,
-            external_id,
-            existing.get("rawRef"),
-        )
-        return {
-            "gcs_uri": str(existing["rawRef"]),
-            "skipped_upload": True,
-            "checksum": sha,
-            "external_id": external_id,
-            "dry_run": config.cloud_dry_run(),
-        }
-
-    log.info(
-        "pdf upload WRITE checksum_new_or_changed court=%s externalId=%s checksum=%s...",
-        court_key,
-        external_id,
-        sha[:16],
+        file_sha[:16],
     )
     up = upload_pdf(
         local_path=local_path,
@@ -749,11 +763,139 @@ def _upload_pdf_unless_checksum_unchanged(
         list_type=list_enum,
         source_url=source_url,
         filename=filename,
+        edition=edition,
+        bench_type=bench_type,
     )
     up["skipped_upload"] = False
-    up["checksum"] = sha
+    up["checksum"] = file_sha  # file hash for logs/GCS meta only; not CauseList.checksum
     up["external_id"] = external_id
     return up
+
+
+def _scrape_mphc_streaming(*, date: str) -> dict[str, Any]:
+    """MPHC: per combo fetch → parse → checksum gate → upsert/notify; then next."""
+    from all_causelist.mphc import iter_mphc_combo_units
+
+    combo_total = 0
+    combos_ok = 0
+    combos_error = 0
+    combos_empty = 0
+    case_count = 0
+    docs_written = 0
+    docs_unchanged = 0
+    notify_ok = 0
+    notify_fail = 0
+    notify_skip = 0
+
+    def _progress(msg: str) -> None:
+        log.info("mphc %s", msg)
+
+    for unit in iter_mphc_combo_units(date, on_progress=_progress):
+        combo_total = int(unit.get("combo_total") or combo_total)
+        idx = unit.get("combo_index")
+        meta = unit.get("combo_meta") or {}
+        docs = list(unit.get("documents") or [])
+        case_count += int(unit.get("case_count") or 0)
+
+        if meta.get("error"):
+            combos_error += 1
+            log.warning(
+                "mphc combo %s/%s error=%s",
+                idx,
+                combo_total,
+                meta.get("error"),
+            )
+            continue
+        if not docs:
+            combos_empty += 1
+            continue
+
+        combos_ok += 1
+        mini_main = {
+            "courtKey": "mphc",
+            "hearingDate": date,
+            "documents": docs,
+            "item_count": sum(len(d.get("items") or []) for d in docs),
+            "document_count": len(docs),
+        }
+        mongo, notify = _upsert_html_documents_with_checksum_gate(
+            court_key="mphc",
+            main_output=mini_main,
+        )
+        docs_written += int(mongo.get("documents_written") or 0)
+        docs_unchanged += int(mongo.get("documents_unchanged") or 0)
+        notify_ok += int(notify.get("notify_ok") or 0)
+        notify_fail += int(notify.get("notify_fail") or 0)
+        notify_skip += int(notify.get("notify_skip") or 0)
+        log.info(
+            "mphc combo %s/%s upsert done label=%s docs=%s written=%s unchanged=%s notify=%s",
+            idx,
+            combo_total,
+            meta.get("label"),
+            len(docs),
+            mongo.get("documents_written"),
+            mongo.get("documents_unchanged"),
+            notify.get("status"),
+        )
+        # Drop references before next combo.
+        del docs
+        del mini_main
+
+    from all_causelist.cloud.jobs import STATUS_COMPLETE, set_job_status
+
+    set_job_status(court="mphc", date=date, status=STATUS_COMPLETE)
+    log.info(
+        "mphc stream scrape done date=%s combos=%s ok=%s empty=%s err=%s cases=%s "
+        "docs_written=%s docs_unchanged=%s",
+        date,
+        combo_total,
+        combos_ok,
+        combos_empty,
+        combos_error,
+        case_count,
+        docs_written,
+        docs_unchanged,
+    )
+
+    if combo_total > 0 and combos_ok == 0 and case_count == 0 and combos_error == combo_total:
+        out = _not_published_response(
+            court_key="mphc",
+            date=date,
+            reason=f"All MPHC combos failed for {date}",
+        )
+        out["path"] = "html_combo_stream"
+        return out
+
+    if case_count == 0 and docs_written == 0 and combos_ok == 0:
+        out = _not_published_response(
+            court_key="mphc",
+            date=date,
+            reason=f"No cause list items for mphc on {date}",
+        )
+        out["path"] = "html_combo_stream"
+        return out
+
+    return {
+        "status": "ok",
+        "court": "mphc",
+        "date": date,
+        "path": "html_combo_stream",
+        "item_count": case_count,
+        "combo_total": combo_total,
+        "combos_ok": combos_ok,
+        "combos_empty": combos_empty,
+        "combos_error": combos_error,
+        "mongodb": {
+            "documents_written": docs_written,
+            "documents_unchanged": docs_unchanged,
+        },
+        "notify": {
+            "notify_ok": notify_ok,
+            "notify_fail": notify_fail,
+            "notify_skip": notify_skip,
+        },
+        "local_output_cleaned": True,
+    }
 
 
 def _upsert_html_documents_with_checksum_gate(
@@ -783,8 +925,14 @@ def _upsert_html_documents_with_checksum_gate(
         hearing = doc.get("hearingDate") or hearing_fallback
         list_type = str(doc.get("listType") or "main")
         bench_label = str(doc.get("benchLabel") or "")
+        edition = str(doc.get("edition") or "")
+        bench_type = str(doc.get("benchType") or "")
+        doc["edition"] = edition
+        doc["benchType"] = bench_type
         # Normalize to contract externalId before lookup / write.
-        doc["externalId"] = make_external_id(ck, hearing, list_type, bench_label)
+        doc["externalId"] = make_external_id(
+            ck, hearing, list_type, bench_label, edition, bench_type
+        )
         existing = find_cause_list_unit(
             source=str(doc.get("source") or COURT_SOURCE[court_key]),
             court_key=ck,
@@ -792,6 +940,8 @@ def _upsert_html_documents_with_checksum_gate(
             list_type=list_type,
             bench_label=bench_label,
             external_id=doc["externalId"],
+            edition=edition,
+            bench_type=bench_type,
         )
         sha = doc.get("checksum")
         stored_sha = (existing or {}).get("checksum")

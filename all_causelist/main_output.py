@@ -37,6 +37,8 @@ def _stamp_group(
     source_url: str = "",
     raw_ref: str | None = None,
     content_type: str | None = None,
+    edition: str = "",
+    bench_type: str = "",
 ) -> dict[str, Any]:
     stamped = dict(row)
     stamped["_group"] = {
@@ -46,8 +48,31 @@ def _stamp_group(
         "source_url": source_url,
         "rawRef": raw_ref,
         "contentType": content_type,
+        "edition": (edition or "").strip(),
+        "benchType": (bench_type or "").strip(),
     }
     return stamped
+
+
+def strip_raw_html_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop ``rawHtml`` before writing court JSON (not needed after parse)."""
+    if not isinstance(payload, dict):
+        return payload
+    cleaned = dict(payload)
+    for key in ("benches", "combos", "judges"):
+        items = cleaned.get(key)
+        if not isinstance(items, list):
+            continue
+        next_items: list[Any] = []
+        for item in items:
+            if isinstance(item, dict) and "rawHtml" in item:
+                copy = dict(item)
+                copy.pop("rawHtml", None)
+                next_items.append(copy)
+            else:
+                next_items.append(item)
+        cleaned[key] = next_items
+    return cleaned
 
 
 def collect_cases(court: str, data: Any) -> list[dict[str, Any]]:
@@ -115,6 +140,10 @@ def collect_cases(court: str, data: Any) -> list[dict[str, Any]]:
             bench_label = str(
                 combo.get("judge") or combo.get("bench") or combo.get("label") or ""
             ).strip()
+            # MPHC portal sbdb → CauseList.benchType (single_bench / division_bench / …).
+            bench_type = str(
+                combo.get("sbdb_label") or combo.get("benchType") or ""
+            ).strip()
             for row in combo.get("rows") or combo.get("cases") or []:
                 if not isinstance(row, dict):
                     continue
@@ -126,6 +155,8 @@ def collect_cases(court: str, data: Any) -> list[dict[str, Any]]:
                         list_type_display=str(
                             row.get("list_type") or combo.get("list_type") or "DAILY LIST"
                         ),
+                        edition="",
+                        bench_type=bench_type,
                     )
                 )
         return rows

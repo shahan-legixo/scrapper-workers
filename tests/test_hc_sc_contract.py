@@ -19,6 +19,7 @@ if str(_ROOT) not in sys.path:
 from all_causelist.all_schemas.schema import (  # noqa: E402
     compute_checksum,
     compute_fingerprint,
+    compute_parsed_unit_checksum,
     make_cause_list_item,
     make_external_id,
     parse_printed_case_number,
@@ -178,6 +179,83 @@ class ChecksumContractTests(unittest.TestCase):
         raw = b"%PDF-1.4 fake"
         self.assertEqual(compute_checksum(raw), hashlib.sha256(raw).hexdigest())
         self.assertEqual(compute_checksum(raw), compute_checksum(raw))
+
+    def test_parsed_unit_checksum_uses_all_item_fields(self) -> None:
+        """CauseList.checksum = hash of parsed fields (not raw HTML/PDF bytes)."""
+        from all_causelist.main_output import build_main_output, collect_cases
+
+        payload = {
+            "benches": [
+                {
+                    "judge": "JUSTICE TEST",
+                    "rawHtml": "<html>ignored for checksum</html>",
+                    "lists": {
+                        "daily": [
+                            {
+                                "caseNumber": ["WP/1/2026"],
+                                "list_type": "DAILY LIST",
+                                "judge": "JUSTICE TEST",
+                                "party": "A vs B",
+                                "purpose": "EVIDENCE",
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        main = build_main_output(
+            court="delhi",
+            cause_date="2026-10-22",
+            cases=collect_cases("delhi", payload),
+        )
+        doc = main["documents"][0]
+        expected = compute_parsed_unit_checksum(
+            court_key="dlhc",
+            hearing_date="2026-10-22",
+            list_type=doc["listType"],
+            bench_label=doc["benchLabel"],
+            items=doc["items"],
+            external_id=doc.get("externalId") or "",
+        )
+        self.assertEqual(doc["checksum"], expected)
+        self.assertNotEqual(
+            doc["checksum"],
+            compute_checksum(b"<html>ignored for checksum</html>"),
+        )
+        self.assertTrue(doc["items"][0].get("fingerprint"))
+
+    def test_parsed_checksum_changes_when_party_changes(self) -> None:
+        """Party is in parsed fields → checksum changes (fingerprint may not)."""
+        from all_causelist.main_output import build_main_output, collect_cases
+
+        def _payload(party: str) -> dict:
+            return {
+                "benches": [
+                    {
+                        "judge": "JUSTICE TEST",
+                        "lists": {
+                            "daily": [
+                                {
+                                    "caseNumber": ["WP/1/2026"],
+                                    "list_type": "DAILY LIST",
+                                    "judge": "JUSTICE TEST",
+                                    "party": party,
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+
+        d1 = build_main_output(
+            court="delhi", cause_date="2026-10-22", cases=collect_cases("delhi", _payload("A"))
+        )["documents"][0]
+        d2 = build_main_output(
+            court="delhi", cause_date="2026-10-22", cases=collect_cases("delhi", _payload("B"))
+        )["documents"][0]
+        self.assertNotEqual(d1["checksum"], d2["checksum"])
+        # Fingerprint still ignores party.
+        self.assertEqual(d1["items"][0]["fingerprint"], d2["items"][0]["fingerprint"])
 
 
 class ItemUpsertKeyTests(unittest.TestCase):
@@ -428,7 +506,7 @@ class NotifyClientTests(unittest.TestCase):
 
 
 class ExternalIdContractTests(unittest.TestCase):
-    def test_court_date_list_bench_format(self) -> None:
+    def test_court_date_list_bench_edition_benchtype_format(self) -> None:
         eid = make_external_id(
             "dlhc",
             "2026-10-14",
@@ -437,101 +515,314 @@ class ExternalIdContractTests(unittest.TestCase):
         )
         self.assertEqual(
             eid,
-            "dlhc:2026-10-14:advance:HON'BLE MR. JUSTICE ANISH DAYAL (C)",
+            "dlhc:2026-10-14:advance:HON'BLE MR. JUSTICE ANISH DAYAL (C)::",
         )
         self.assertNotIn("http", eid)
         self.assertNotIn("gs://", eid)
 
+    def test_edition_and_bench_type_in_external_id(self) -> None:
+        eid = make_external_id(
+            "mphc",
+            "2026-10-22",
+            "MOTION LIST",
+            "HON'BLE JUSTICE A",
+            edition="",
+            bench_type="single_bench",
+        )
+        self.assertEqual(
+            eid,
+            "mphc:2026-10-22:MOTION LIST:HON'BLE JUSTICE A::single_bench",
+        )
+
+
+class ListTypeStoredTests(unittest.TestCase):
+    def test_daily_stays_daily_not_main(self) -> None:
+        from all_causelist.all_schemas.schema import normalize_list_type_enum
+
+        self.assertEqual(normalize_list_type_enum("Daily Main"), "daily")
+        self.assertEqual(normalize_list_type_enum("daily"), "daily")
+
+    def test_daily_supplementary_exact_not_daily(self) -> None:
+        from all_causelist.all_schemas.schema import normalize_list_type_enum
+
+        self.assertEqual(
+            normalize_list_type_enum("Daily Supplementary"), "supplementary"
+        )
+
+    def test_unknown_uppercased(self) -> None:
+        from all_causelist.all_schemas.schema import normalize_list_type_enum
+
+        self.assertEqual(normalize_list_type_enum("MOTION LIST"), "MOTION LIST")
+        self.assertEqual(normalize_list_type_enum("motion"), "MOTION")
+
 
 class GcsPathTests(unittest.TestCase):
     def test_causelist_prefix(self) -> None:
-        from all_causelist.cloud.gcs import gcs_object_path
+        from all_causelist.cloud.gcs import bmhc_coram_pdf_filename, gcs_object_path
 
+        name = bmhc_coram_pdf_filename(
+            "HON'BLE THE CHIEF JUSTICE HON'BLE JUSTICE ADVAIT M. SETHNA"
+        )
         path = gcs_object_path(
             court_key="bmhc",
             hearing_date="2026-10-12",
-            list_type="main",
-            filename="coram-01.pdf",
+            list_type="daily",
+            filename=name,
         )
-        self.assertEqual(path, "causelist/bmhc/2026-10-12/main/coram-01.pdf")
+        self.assertEqual(
+            path.split("/")[:6],
+            ["causelist", "bmhc", "2026-10-12", "daily", "_", "_"],
+        )
+        self.assertTrue(path.endswith(".pdf"))
+        self.assertIn("CHIEF", path)
+        self.assertNotIn("Daily_Main", path)
+
+    def test_bmhc_coram_filename_uses_coram_name(self) -> None:
+        from all_causelist.cloud.gcs import bmhc_coram_pdf_filename, gcs_object_path
+
+        name = bmhc_coram_pdf_filename("HON'BLE SHRI JUSTICE S. M. MODAK")
+        self.assertEqual(name, "HON_BLE_SHRI_JUSTICE_S._M._MODAK.pdf")
+        path = gcs_object_path(
+            court_key="bmhc",
+            hearing_date="2026-10-22",
+            list_type="supplementary",
+            filename=name,
+        )
+        self.assertEqual(
+            path,
+            "causelist/bmhc/2026-10-22/supplementary/_/_/HON_BLE_SHRI_JUSTICE_S._M._MODAK.pdf",
+        )
+
+    def test_bmhc_weekly_filename_includes_tag(self) -> None:
+        from all_causelist.cloud.gcs import bmhc_coram_pdf_filename, gcs_object_path
+        from all_causelist.all_schemas.schema import normalize_list_type_enum
+
+        # Exact weekly aliases → weekly; "Weekly Main - 5" is free uppercased label.
+        self.assertEqual(normalize_list_type_enum("weekly"), "weekly")
+        self.assertEqual(
+            normalize_list_type_enum("Weekly Main - 5"), "WEEKLY MAIN - 5"
+        )
+        name = bmhc_coram_pdf_filename(
+            "HON'BLE JUSTICE A",
+            source_list="Weekly Main - 5",
+        )
+        self.assertEqual(name, "HON_BLE_JUSTICE_A__Weekly_Main_-_5.pdf")
+        path = gcs_object_path(
+            court_key="bmhc",
+            hearing_date="2026-10-22",
+            list_type="Weekly Main - 5",
+            filename=name,
+        )
+        self.assertEqual(
+            path,
+            "causelist/bmhc/2026-10-22/WEEKLY-MAIN---5/_/_/HON_BLE_JUSTICE_A__Weekly_Main_-_5.pdf",
+        )
+        name2 = bmhc_coram_pdf_filename(
+            "HON'BLE JUSTICE A",
+            source_list="Weekly Main - 1",
+        )
+        self.assertNotEqual(name, name2)
+
+    def test_gcs_path_includes_edition_and_bench_type(self) -> None:
+        from all_causelist.cloud.gcs import gcs_object_path
+
+        path = gcs_object_path(
+            court_key="mphc",
+            hearing_date="2026-10-22",
+            list_type="MOTION LIST",
+            filename="bench.pdf",
+            edition="",
+            bench_type="single_bench",
+        )
+        self.assertEqual(
+            path,
+            "causelist/mphc/2026-10-22/MOTION-LIST/_/single_bench/bench.pdf",
+        )
+
+    def test_bmhc_iter_sets_coram_name_gcs_filename(self) -> None:
+        from all_causelist.bombay import iter_downloaded_pdfs
+
+        rows = iter_downloaded_pdfs(
+            {
+                "corams": [
+                    {
+                        "coram": "HON'BLE JUSTICE A",
+                        "coram_index": 1,
+                        "pdfs": [
+                            {
+                                "list_type": "Daily Main",
+                                "url": "https://example/signed?x=1",
+                                "pdf_path": "/tmp/Daily_Main.pdf",
+                            },
+                            {
+                                "list_type": "Daily Supplementary",
+                                "url": "https://example/signed?x=2",
+                                "pdf_path": "/tmp/Daily_Supplementary.pdf",
+                            },
+                            {
+                                "list_type": "Weekly Main - 5",
+                                "url": "https://example/signed?x=3",
+                                "pdf_path": "/tmp/Weekly_Main_-_5.pdf",
+                            },
+                        ],
+                    },
+                    {
+                        "coram": "HON'BLE JUSTICE B",
+                        "coram_index": 2,
+                        "pdfs": [
+                            {
+                                "list_type": "Daily Main",
+                                "url": "https://example/signed?y=1",
+                                "pdf_path": "/tmp/other/Daily_Main.pdf",
+                            }
+                        ],
+                    },
+                ]
+            }
+        )
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0]["filename"], "HON_BLE_JUSTICE_A.pdf")
+        self.assertEqual(rows[1]["filename"], "HON_BLE_JUSTICE_A.pdf")
+        self.assertEqual(
+            rows[2]["filename"], "HON_BLE_JUSTICE_A__Weekly_Main_-_5.pdf"
+        )
+        self.assertEqual(rows[3]["filename"], "HON_BLE_JUSTICE_B.pdf")
+
+    def test_bmhc_iter_dedupes_same_pdf_path_across_coram_rows(self) -> None:
+        """Portal may list the same judge twice; shared pdf_path must appear once."""
+        from all_causelist.bombay import iter_downloaded_pdfs
+
+        shared = str(Path("/tmp/shared_coram/Daily_Supplementary.pdf"))
+        rows = iter_downloaded_pdfs(
+            {
+                "corams": [
+                    {
+                        "coram": "HON'BLE JUSTICE A",
+                        "coram_index": 1,
+                        "pdfs": [
+                            {
+                                "list_type": "Daily Supplementary",
+                                "url": "https://example/a",
+                                "pdf_path": shared,
+                            }
+                        ],
+                    },
+                    {
+                        "coram": "HON'BLE JUSTICE A",
+                        "coram_index": 2,
+                        "pdfs": [
+                            {
+                                "list_type": "Daily Main",
+                                "url": "https://example/b",
+                                "pdf_path": "/tmp/shared_coram/Daily_Main.pdf",
+                            },
+                            {
+                                "list_type": "Daily Supplementary",
+                                "url": "https://example/c",
+                                "pdf_path": shared,
+                            },
+                        ],
+                    },
+                ]
+            }
+        )
+        paths = [r["pdf_path"] for r in rows]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(paths.count(shared), 1)
+
+    def test_bmhc_select_links_includes_weekly(self) -> None:
+        from all_causelist.bombay import _select_links
+
+        links = [
+            {"list_type": "Daily Main", "url": "u1"},
+            {"list_type": "Daily Supplementary", "url": "u2"},
+            {"list_type": "Weekly Main - 5", "url": "u3"},
+            {"list_type": "Weekly Main - 1", "url": "u4"},
+            {"list_type": "Chamber", "url": "u5"},
+        ]
+        selected = _select_links(links, all_types=False)
+        names = [x["list_type"] for x in selected]
+        self.assertEqual(
+            names,
+            [
+                "Daily Main",
+                "Daily Supplementary",
+                "Weekly Main - 5",
+                "Weekly Main - 1",
+            ],
+        )
 
 
 class GcsUploadSkipTests(unittest.TestCase):
-    def test_skip_upload_when_checksum_and_rawref_match(self) -> None:
+    def test_upload_always_writes_gcs_parsed_checksum_gated_in_parse(self) -> None:
+        """Upload no longer skips on CauseList.checksum (that is parsed-fields)."""
         from all_causelist.cloud.handlers import _upload_pdf_unless_checksum_unchanged
 
-        sha = compute_checksum(_FIXTURE_PDF)
-        existing = {
-            "_id": ObjectId(),
-            "checksum": sha,
-            "rawRef": "gs://legixo-docs-dev/causelist/dlhc/2026-10-14/advance/list.pdf",
-        }
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "list.pdf"
             path.write_bytes(_FIXTURE_PDF)
             with patch(
-                "all_causelist.cloud.handlers.find_cause_list_unit",
-                return_value=existing,
-            ):
-                with patch("all_causelist.cloud.handlers.upload_pdf") as upload:
-                    result = _upload_pdf_unless_checksum_unchanged(
-                        local_path=path,
-                        court_key="dlhc",
-                        hearing_date="2026-10-14",
-                        list_type="advance",
-                        bench_label="HON'BLE MR. JUSTICE ANISH DAYAL (C)",
-                        source_url="https://example.com/x.pdf",
-                        filename="list.pdf",
-                    )
-        self.assertTrue(result["skipped_upload"])
-        self.assertEqual(result["gcs_uri"], existing["rawRef"])
-        upload.assert_not_called()
-
-    def test_upload_when_checksum_differs(self) -> None:
-        from all_causelist.cloud.handlers import _upload_pdf_unless_checksum_unchanged
-
-        existing = {
-            "_id": ObjectId(),
-            "checksum": compute_checksum(_FIXTURE_PDF),
-            "rawRef": "gs://legixo-docs-dev/causelist/dlhc/2026-10-14/advance/list.pdf",
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "list.pdf"
-            path.write_bytes(_FIXTURE_PDF_V2)
-            with patch(
-                "all_causelist.cloud.handlers.find_cause_list_unit",
-                return_value=existing,
-            ):
-                with patch(
-                    "all_causelist.cloud.handlers.upload_pdf",
-                    return_value={"gcs_uri": "gs://new/path.pdf", "dry_run": True},
-                ) as upload:
-                    result = _upload_pdf_unless_checksum_unchanged(
-                        local_path=path,
-                        court_key="dlhc",
-                        hearing_date="2026-10-14",
-                        list_type="advance",
-                        bench_label="BENCH",
-                        source_url=None,
-                        filename="list.pdf",
-                    )
+                "all_causelist.cloud.handlers.upload_pdf",
+                return_value={"gcs_uri": "gs://new/path.pdf", "dry_run": True},
+            ) as upload:
+                result = _upload_pdf_unless_checksum_unchanged(
+                    local_path=path,
+                    court_key="dlhc",
+                    hearing_date="2026-10-14",
+                    list_type="advance",
+                    bench_label="BENCH",
+                    source_url=None,
+                    filename="list.pdf",
+                )
         self.assertFalse(result["skipped_upload"])
         self.assertEqual(result["gcs_uri"], "gs://new/path.pdf")
         upload.assert_called_once()
 
 
 class StoreRematchFlowTests(unittest.TestCase):
-    """Fixture-unit style: same PDF twice → skip rewrite; still rematch/notify."""
+    """Same parsed fields twice → skip rewrite; still rematch/notify."""
 
     def test_handle_parse_checksum_unchanged_skips_upsert_still_notifies(self) -> None:
         from all_causelist.cloud import handlers
 
-        sha = compute_checksum(_FIXTURE_PDF)
         doc_id = ObjectId()
         item_id = ObjectId()
+        label = "HON'BLE MR. JUSTICE ANISH DAYAL (C)"
+        block = {
+            "bench": label,
+            "list_type": "ADVANCED LIST",
+            "cases": [
+                {
+                    "date": "2026-10-14",
+                    "caseNumber": ["WP/1/2024"],
+                    "party": "A vs B",
+                    "judge": [label],
+                    "list_type": "ADVANCED LIST",
+                    "listing_no": 1,
+                    "purpose": "EVIDENCE",
+                }
+            ],
+        }
+        # Pre-compute parsed checksum the handler will stamp.
+        from all_causelist.all_schemas.schema import (
+            group_flat_cases_to_documents,
+            make_external_id,
+        )
+
+        cases = list(block["cases"])
+        for row in cases:
+            row["_group"] = {
+                "benchLabel": label,
+                "list_type_display": "ADVANCED LIST",
+                "externalId": make_external_id("dlhc", "2026-10-14", "advance", label),
+            }
+        docs = group_flat_cases_to_documents(
+            court_key="dlhc", hearing_date="2026-10-14", cases=cases
+        )
+        parsed_sha = docs[0]["checksum"]
         existing = {
             "_id": doc_id,
-            "checksum": sha,
+            "checksum": parsed_sha,
             "rawRef": "gs://legixo-docs-dev/causelist/dlhc/2026-10-14/advance/x.pdf",
         }
         items = [
@@ -549,27 +840,32 @@ class StoreRematchFlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "list.pdf"
             path.write_bytes(_FIXTURE_PDF)
-            with patch.object(handlers, "find_cause_list_unit", return_value=existing):
-                with patch.object(
-                    handlers, "list_items_for_document", return_value=items
-                ) as list_items:
+            with patch.object(
+                handlers, "_cases_from_pdf_for_court", return_value=block
+            ):
+                with patch.object(handlers, "find_cause_list_unit", return_value=existing):
                     with patch.object(
-                        handlers,
-                        "match_and_notify_items",
-                        return_value={"matched_items": 1, "notify_ok": 0},
-                    ) as notify:
-                        with patch.object(handlers, "upsert_main_output") as upsert:
-                            with patch.object(handlers, "bump_parsed", return_value={}):
-                                result = handlers.handle_parse(
-                                    {
-                                        "court": "dlhc",
-                                        "date": "2026-10-14",
-                                        "list_type": "advance",
-                                        "label": "HON'BLE MR. JUSTICE ANISH DAYAL (C)",
-                                        "gcs_uri": existing["rawRef"],
-                                        "local_path": str(path),
-                                    }
-                                )
+                        handlers, "list_items_for_document", return_value=items
+                    ) as list_items:
+                        with patch.object(
+                            handlers,
+                            "match_and_notify_items",
+                            return_value={"matched_items": 1, "notify_ok": 0},
+                        ) as notify:
+                            with patch.object(handlers, "upsert_main_output") as upsert:
+                                with patch.object(
+                                    handlers, "bump_parsed", return_value={}
+                                ):
+                                    result = handlers.handle_parse(
+                                        {
+                                            "court": "dlhc",
+                                            "date": "2026-10-14",
+                                            "list_type": "advance",
+                                            "label": label,
+                                            "gcs_uri": existing["rawRef"],
+                                            "local_path": str(path),
+                                        }
+                                    )
         self.assertTrue(result["checksum_unchanged"])
         upsert.assert_not_called()
         list_items.assert_called_once_with(doc_id)
@@ -1464,6 +1760,111 @@ class MongoCollectionNamesTests(unittest.TestCase):
         with patch("db.mongo._db", return_value=mock_db):
             mongo.list_items_for_document(ObjectId())
         mock_db.__getitem__.assert_called_with("causelistitems")
+
+
+class MphcComboStreamTests(unittest.TestCase):
+    def test_combo_to_documents_builds_parsed_checksum(self) -> None:
+        from all_causelist.mphc import combo_to_documents
+
+        combo = {
+            "place": "JBP",
+            "place_label": "Jabalpur",
+            "mfb": "M",
+            "mfb_label": "motion",
+            "list_type": "MOTION LIST",
+            "sbdb": "1",
+            "sbdb_label": "single_bench",
+            "row_count": 1,
+            "rows": [
+                {
+                    "date": "2026-10-22",
+                    "courtName": "High Court of Madhya Pradesh (Jabalpur)",
+                    "courtNo": "01",
+                    "listingNo": 1,
+                    "caseNumber": ["MA/3963/2023"],
+                    "party": "A vs B",
+                    "judge": ["HON'BLE JUSTICE TEST"],
+                    "list_type": "MOTION LIST",
+                }
+            ],
+        }
+        docs = combo_to_documents(combo, cause_date="2026-10-22")
+        self.assertTrue(docs)
+        self.assertTrue(docs[0].get("checksum"))
+        self.assertTrue(docs[0].get("items"))
+        self.assertEqual(docs[0].get("benchType"), "single_bench")
+        self.assertEqual(docs[0].get("edition"), "")
+        self.assertTrue(docs[0]["externalId"].endswith(":single_bench"))
+        self.assertEqual(docs[0].get("listType"), "MOTION LIST")
+
+    def test_scrape_mphc_streaming_upserts_per_combo(self) -> None:
+        from all_causelist.cloud import handlers
+
+        doc_a = {
+            "courtKey": "mphc",
+            "hearingDate": "2026-10-22",
+            "listType": "miscellaneous",
+            "benchLabel": "BENCH A",
+            "checksum": "aaa",
+            "externalId": "mphc:2026-10-22:miscellaneous:BENCH A",
+            "items": [{"fingerprint": "f1"}],
+        }
+        doc_b = {
+            "courtKey": "mphc",
+            "hearingDate": "2026-10-22",
+            "listType": "miscellaneous",
+            "benchLabel": "BENCH B",
+            "checksum": "bbb",
+            "externalId": "mphc:2026-10-22:miscellaneous:BENCH B",
+            "items": [{"fingerprint": "f2"}],
+        }
+
+        def _gen():
+            yield {
+                "combo_index": 1,
+                "combo_total": 2,
+                "combo_meta": {"label": "JBP / motion / single", "row_count": 1},
+                "documents": [doc_a],
+                "case_count": 1,
+            }
+            yield {
+                "combo_index": 2,
+                "combo_total": 2,
+                "combo_meta": {"label": "IND / motion / single", "row_count": 1},
+                "documents": [doc_b],
+                "case_count": 1,
+            }
+
+        calls: list[list[str]] = []
+
+        def _fake_upsert(*, court_key, main_output):
+            eids = [d.get("externalId") for d in main_output.get("documents") or []]
+            calls.append(eids)
+            return (
+                {"documents_written": len(eids), "documents_unchanged": 0},
+                {"status": "ok", "notify_ok": 0, "notify_fail": 0, "notify_skip": 1},
+            )
+
+        with patch(
+            "all_causelist.mphc.iter_mphc_combo_units",
+            return_value=_gen(),
+        ):
+            with patch.object(
+                handlers, "_upsert_html_documents_with_checksum_gate", side_effect=_fake_upsert
+            ):
+                with patch.object(handlers, "mark_parsing"):
+                    with patch(
+                        "all_causelist.cloud.jobs.set_job_status", return_value={}
+                    ):
+                        result = handlers._scrape_mphc_streaming(date="2026-10-22")
+
+        self.assertEqual(result["path"], "html_combo_stream")
+        self.assertEqual(result["combos_ok"], 2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], [doc_a["externalId"]])
+        self.assertEqual(calls[1], [doc_b["externalId"]])
+        # Second call must not include first combo's doc.
+        self.assertNotIn(doc_a["externalId"], calls[1])
 
 
 if __name__ == "__main__":

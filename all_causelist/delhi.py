@@ -295,6 +295,8 @@ def _parse_details(
         "side": bench["side"],
         "judge": bench["judge"],
         "lists": lists,
+        # Full page HTML — CauseList.checksum = SHA-256 of these bytes after parse.
+        "rawHtml": html,
     }
     if missing:
         parsed["error"] = "Missing sections: " + ", ".join(missing)

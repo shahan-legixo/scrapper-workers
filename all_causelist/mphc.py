@@ -8,7 +8,7 @@ import ssl
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Iterator
 from urllib.parse import urljoin
 
 import httpx
@@ -67,7 +67,22 @@ class MphcCauseListError(RuntimeError):
     """The Madhya Pradesh High Court cause list could not be fetched."""
 
 
-def fetch_mphc_cause_list(
+def combo_to_documents(combo: dict[str, Any], *, cause_date: str) -> list[dict[str, Any]]:
+    """One scraped MPHC combo → Legixo CauseList documents (parsed-fields checksum)."""
+    from .all_schemas.schema import group_flat_cases_to_documents
+    from .main_output import collect_cases
+
+    cases = collect_cases("mphc", {"combos": [combo]})
+    if not cases:
+        return []
+    return group_flat_cases_to_documents(
+        court_key="mphc",
+        hearing_date=cause_date,
+        cases=cases,
+    )
+
+
+def iter_mphc_combo_units(
     cause_date: str,
     *,
     places: list[str] | None = None,
@@ -75,10 +90,18 @@ def fetch_mphc_cause_list(
     sbdb_filter: str | None = None,
     delay_seconds: float = 1.0,
     on_progress: Callable[[str], None] | None = None,
-) -> dict:
-    """Fetch Judge-tab causelist combos for ``cause_date`` (YYYY-MM-DD).
+) -> Iterator[dict[str, Any]]:
+    """Yield one combo at a time: fetch → parse → documents; drop HTML before next.
 
-    Defaults: all places (JBP/IND/GWL) × all mfb (M/F/L/S) × all sbdb (1/2/3).
+    Each yield::
+
+        {
+          "combo_index": int,
+          "combo_total": int,
+          "combo_meta": {...},
+          "documents": [CauseList, ...],
+          "case_count": int,
+        }
     """
     display_date = _to_display_date(cause_date)
     progress = on_progress or (lambda _message: None)
@@ -95,10 +118,129 @@ def fetch_mphc_cause_list(
     if not combos_plan:
         raise MphcCauseListError("No place/mfb/sbdb combinations to fetch.")
 
+    total = len(combos_plan)
     progress(
-        f"Fetching {len(combos_plan)} MPHC combo(s) for {cause_date} "
+        f"Streaming {total} MPHC combo(s) for {cause_date} "
         f"({', '.join(selected_places)})."
     )
+
+    with httpx.Client(
+        headers=BROWSER_HEADERS,
+        timeout=httpx.Timeout(120.0, connect=60.0),
+        follow_redirects=True,
+        verify=_ssl_context(),
+    ) as client:
+        csrf = ""
+        for attempt in range(1, 4):
+            try:
+                csrf = _warm_and_csrf(client)
+                break
+            except Exception as exc:
+                if attempt == 3:
+                    raise MphcCauseListError(
+                        f"MPHC portal connect failed after 3 attempts: {exc}"
+                    ) from exc
+                time.sleep(2.0 * attempt)
+        last_place: str | None = None
+
+        for index, (place, mfb, sbdb) in enumerate(combos_plan, start=1):
+            if index > 1 and delay_seconds > 0:
+                time.sleep(delay_seconds)
+
+            label = (
+                f"{PLACE_LABELS.get(place, place)} / "
+                f"{MFB_CODES[mfb]} / {SBDB_CODES[sbdb]}"
+            )
+            progress(f"[{index}/{total}] {label}")
+            combo = _fetch_one_combo(
+                client,
+                cause_date=cause_date,
+                display_date=display_date,
+                place=place,
+                mfb=mfb,
+                sbdb=sbdb,
+                csrf=csrf,
+                last_place=last_place,
+            )
+            csrf = combo.pop("_csrf_out", csrf)
+            last_place = combo.pop("_last_place_out", last_place)
+
+            documents = combo_to_documents(combo, cause_date=cause_date)
+            combo.pop("rawHtml", None)
+            meta = {
+                "place": combo.get("place"),
+                "place_label": combo.get("place_label"),
+                "mfb": combo.get("mfb"),
+                "mfb_label": combo.get("mfb_label"),
+                "sbdb": combo.get("sbdb"),
+                "sbdb_label": combo.get("sbdb_label"),
+                "list_type": combo.get("list_type"),
+                "label": label,
+                "error": combo.get("error"),
+                "row_count": combo.get("row_count", 0),
+            }
+            case_count = int(combo.get("row_count") or 0)
+            progress(
+                f"  -> {case_count} cases / {len(documents)} CauseList doc(s)"
+                + (f" error={meta['error']}" if meta.get("error") else "")
+            )
+            yield {
+                "combo_index": index,
+                "combo_total": total,
+                "combo_meta": meta,
+                "documents": documents,
+                "case_count": case_count,
+            }
+            del combo
+            del documents
+
+
+def fetch_mphc_cause_list(
+    cause_date: str,
+    *,
+    places: list[str] | None = None,
+    mfb_filter: str | None = None,
+    sbdb_filter: str | None = None,
+    delay_seconds: float = 1.0,
+    on_progress: Callable[[str], None] | None = None,
+) -> dict:
+    """Fetch all MPHC combos into one payload (CLI / local JSON).
+
+    Cloud path should use :func:`iter_mphc_combo_units` instead (stream + upsert).
+    """
+    return _fetch_mphc_cause_list_accumulate(
+        cause_date,
+        places=places,
+        mfb_filter=mfb_filter,
+        sbdb_filter=sbdb_filter,
+        delay_seconds=delay_seconds,
+        on_progress=on_progress,
+    )
+
+
+def _fetch_mphc_cause_list_accumulate(
+    cause_date: str,
+    *,
+    places: list[str] | None = None,
+    mfb_filter: str | None = None,
+    sbdb_filter: str | None = None,
+    delay_seconds: float = 1.0,
+    on_progress: Callable[[str], None] | None = None,
+) -> dict:
+    """CLI helper: all combos with rows (no rawHtml kept)."""
+    display_date = _to_display_date(cause_date)
+    progress = on_progress or (lambda _message: None)
+    selected_places = _normalize_places(places)
+    mfb_list = _normalize_mfb(mfb_filter)
+    sbdb_list = _normalize_sbdb(sbdb_filter)
+    combos_plan = [
+        (place, mfb, sbdb)
+        for place in selected_places
+        for mfb in mfb_list
+        for sbdb in sbdb_list
+    ]
+    if not combos_plan:
+        raise MphcCauseListError("No place/mfb/sbdb combinations to fetch.")
 
     results: list[dict] = []
     with httpx.Client(
@@ -114,118 +256,36 @@ def fetch_mphc_cause_list(
                 break
             except Exception as exc:
                 if attempt == 3:
-                    raise MphcCauseListError(f"MPHC portal connect failed after 3 attempts: {exc}") from exc
+                    raise MphcCauseListError(
+                        f"MPHC portal connect failed after 3 attempts: {exc}"
+                    ) from exc
                 time.sleep(2.0 * attempt)
         last_place: str | None = None
-
         for index, (place, mfb, sbdb) in enumerate(combos_plan, start=1):
             if index > 1 and delay_seconds > 0:
                 time.sleep(delay_seconds)
-
             label = (
                 f"{PLACE_LABELS.get(place, place)} / "
                 f"{MFB_CODES[mfb]} / {SBDB_CODES[sbdb]}"
             )
             progress(f"[{index}/{len(combos_plan)}] {label}")
+            combo = _fetch_one_combo(
+                client,
+                cause_date=cause_date,
+                display_date=display_date,
+                place=place,
+                mfb=mfb,
+                sbdb=sbdb,
+                csrf=csrf,
+                last_place=last_place,
+            )
+            csrf = combo.pop("_csrf_out", csrf)
+            last_place = combo.pop("_last_place_out", last_place)
+            combo.pop("rawHtml", None)
+            results.append(combo)
+            progress(f"  -> {combo.get('row_count', 0)} cases")
 
-            try:
-                if place != last_place:
-                    _switch_place(client, place)
-                    csrf = _warm_and_csrf(client)
-                    last_place = place
-
-                html = _post_get_cl(
-                    client,
-                    csrf=csrf,
-                    place=place,
-                    display_date=display_date,
-                    mfb=mfb,
-                    sbdb=sbdb,
-                )
-                if html.lstrip().startswith("ERROR"):
-                    raise MphcCauseListError(html.split("|", 1)[0][:300])
-
-                raw_rows = parse_get_cl_html(html)
-                place_court_no = PLACE_CODES[place]  # 01 / 02 / 03 (seat code)
-                place_label = PLACE_LABELS.get(place, place)
-                list_type = normalize_list_type(MFB_CODES[mfb])
-                rows: list[dict] = []
-                for raw in raw_rows:
-                    party = _party_from_sides(raw.get("petitioner"), raw.get("respondent"))
-                    adv_list: list[str] = []
-                    pet_adv = raw.get("advocates")
-                    if isinstance(pet_adv, str) and pet_adv.strip():
-                        adv_list.append(pet_adv.strip())
-                    elif isinstance(pet_adv, list):
-                        adv_list.extend(str(a).strip() for a in pet_adv if a)
-                    for a in raw.get("respondent_advocates") or []:
-                        if a:
-                            adv_list.append(str(a).strip())
-                    rows.append(
-                        make_case(
-                            date=cause_date,
-                            court_name_value=f"{COURT_NAME} ({place_label})",
-                            court_no=place_court_no,
-                            listing_no=raw.get("item_no"),
-                            case_number=raw.get("case_no"),
-                            party=party,
-                            judge=raw.get("judge"),
-                            list_type=list_type,
-                            section=raw.get("section"),
-                            remark=raw.get("remarks"),
-                            advocates=adv_list,
-                            extra={
-                                "place": place,
-                                "place_label": place_label,
-                                "mfb": mfb,
-                                "mfb_label": MFB_CODES[mfb],
-                                "sbdb": sbdb,
-                                "sbdb_label": SBDB_CODES[sbdb],
-                                "item_no": raw.get("item_no"),
-                                "case_no": raw.get("case_no"),
-                                "case_url": raw.get("case_url"),
-                                "petitioner": raw.get("petitioner"),
-                                "respondent": raw.get("respondent"),
-                                "respondent_advocates": raw.get("respondent_advocates"),
-                                "vc_link": raw.get("vc_link"),
-                                "notes": raw.get("notes") or [],
-                                "court": place_court_no,
-                            },
-                        )
-                    )
-
-                results.append(
-                    {
-                        "place": place,
-                        "place_label": PLACE_LABELS.get(place, place),
-                        "mfb": mfb,
-                        "mfb_label": MFB_CODES[mfb],
-                        "list_type": list_type,
-                        "sbdb": sbdb,
-                        "sbdb_label": SBDB_CODES[sbdb],
-                        "row_count": len(rows),
-                        "rows": rows,
-                    }
-                )
-                progress(f"  -> {len(rows)} cases")
-            except (httpx.HTTPError, MphcCauseListError) as exc:
-                results.append(
-                    {
-                        "place": place,
-                        "place_label": PLACE_LABELS.get(place, place),
-                        "mfb": mfb,
-                        "mfb_label": MFB_CODES[mfb],
-                        "list_type": normalize_list_type(MFB_CODES[mfb]),
-                        "sbdb": sbdb,
-                        "sbdb_label": SBDB_CODES[sbdb],
-                        "error": str(exc),
-                        "row_count": 0,
-                        "rows": [],
-                    }
-                )
-                progress(f"  -> error: {exc}")
-
-    case_count = sum(item["row_count"] for item in results)
+    case_count = sum(int(item.get("row_count") or 0) for item in results)
     return {
         "court": "mphc",
         "courtName": COURT_NAME,
@@ -239,10 +299,122 @@ def fetch_mphc_cause_list(
     }
 
 
+def _fetch_one_combo(
+    client: httpx.Client,
+    *,
+    cause_date: str,
+    display_date: str,
+    place: str,
+    mfb: str,
+    sbdb: str,
+    csrf: str,
+    last_place: str | None,
+) -> dict[str, Any]:
+    """Fetch+parse one place/mfb/sbdb combo. Returns combo dict (+ session outs)."""
+    out_csrf = csrf
+    out_place = last_place
+    try:
+        if place != last_place:
+            _switch_place(client, place)
+            out_csrf = _warm_and_csrf(client)
+            out_place = place
+
+        html = _post_get_cl(
+            client,
+            csrf=out_csrf,
+            place=place,
+            display_date=display_date,
+            mfb=mfb,
+            sbdb=sbdb,
+        )
+        if html.lstrip().startswith("ERROR"):
+            raise MphcCauseListError(html.split("|", 1)[0][:300])
+
+        raw_rows = parse_get_cl_html(html)
+        place_court_no = PLACE_CODES[place]
+        place_label = PLACE_LABELS.get(place, place)
+        list_type = normalize_list_type(MFB_CODES[mfb])
+        rows: list[dict] = []
+        for raw in raw_rows:
+            party = _party_from_sides(raw.get("petitioner"), raw.get("respondent"))
+            adv_list: list[str] = []
+            pet_adv = raw.get("advocates")
+            if isinstance(pet_adv, str) and pet_adv.strip():
+                adv_list.append(pet_adv.strip())
+            elif isinstance(pet_adv, list):
+                adv_list.extend(str(a).strip() for a in pet_adv if a)
+            for a in raw.get("respondent_advocates") or []:
+                if a:
+                    adv_list.append(str(a).strip())
+            rows.append(
+                make_case(
+                    date=cause_date,
+                    court_name_value=f"{COURT_NAME} ({place_label})",
+                    court_no=place_court_no,
+                    listing_no=raw.get("item_no"),
+                    case_number=raw.get("case_no"),
+                    party=party,
+                    judge=raw.get("judge"),
+                    list_type=list_type,
+                    section=raw.get("section"),
+                    remark=raw.get("remarks"),
+                    advocates=adv_list,
+                    extra={
+                        "place": place,
+                        "place_label": place_label,
+                        "mfb": mfb,
+                        "mfb_label": MFB_CODES[mfb],
+                        "sbdb": sbdb,
+                        "sbdb_label": SBDB_CODES[sbdb],
+                        "item_no": raw.get("item_no"),
+                        "case_no": raw.get("case_no"),
+                        "case_url": raw.get("case_url"),
+                        "petitioner": raw.get("petitioner"),
+                        "respondent": raw.get("respondent"),
+                        "respondent_advocates": raw.get("respondent_advocates"),
+                        "vc_link": raw.get("vc_link"),
+                        "notes": raw.get("notes") or [],
+                        "court": place_court_no,
+                    },
+                )
+            )
+
+        combo: dict[str, Any] = {
+            "place": place,
+            "place_label": PLACE_LABELS.get(place, place),
+            "mfb": mfb,
+            "mfb_label": MFB_CODES[mfb],
+            "list_type": list_type,
+            "sbdb": sbdb,
+            "sbdb_label": SBDB_CODES[sbdb],
+            "row_count": len(rows),
+            "rows": rows,
+            "rawHtml": html,
+            "_csrf_out": out_csrf,
+            "_last_place_out": out_place,
+        }
+        return combo
+    except (httpx.HTTPError, MphcCauseListError) as exc:
+        return {
+            "place": place,
+            "place_label": PLACE_LABELS.get(place, place),
+            "mfb": mfb,
+            "mfb_label": MFB_CODES[mfb],
+            "list_type": normalize_list_type(MFB_CODES[mfb]),
+            "sbdb": sbdb,
+            "sbdb_label": SBDB_CODES[sbdb],
+            "error": str(exc),
+            "row_count": 0,
+            "rows": [],
+            "_csrf_out": out_csrf,
+            "_last_place_out": out_place if out_place is not None else last_place,
+        }
+
+
 def write_json(payload: dict, output_dir: Path) -> Path:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    from .main_output import write_main_output_from_payload
+    from .main_output import strip_raw_html_from_payload, write_main_output_from_payload
 
     write_main_output_from_payload(
         output_dir,
@@ -252,7 +424,10 @@ def write_json(payload: dict, output_dir: Path) -> Path:
         court_name=payload.get("courtName") or COURT_NAME,
     )
     path = output_dir / f"causelist-{payload['date']}.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(strip_raw_html_from_payload(payload), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return path
 
 

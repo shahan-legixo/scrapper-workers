@@ -22,6 +22,7 @@ COURT_NAME = court_name("bombay")
 PAGE_URL = f"{BASE}/bhc/causelistFinal"
 GET_DATA_URL = f"{BASE}/bhc/causelist/get-data"
 
+# Default scrape: daily + weekly (chamber / production / officer need all_types=True).
 DEFAULT_LIST_TYPES = frozenset({"daily main", "daily supplementary"})
 
 BROWSER_HEADERS = {
@@ -50,8 +51,8 @@ def fetch_bombay_cause_list(
 ) -> dict:
     """Download Bombay cause-list PDFs for ``cause_date`` (YYYY-MM-DD).
 
-    By default only Daily Main and Daily Supplementary links are fetched.
-    Pass ``all_types=True`` for weekly / chamber / production / officer lists too.
+    By default Daily Main, Daily Supplementary, and Weekly* links are fetched.
+    Pass ``all_types=True`` for chamber / production / officer lists too.
     """
     display_date = _to_display_date(cause_date)
     progress = on_progress or (lambda _message: None)
@@ -109,6 +110,7 @@ def fetch_bombay_cause_list(
             results.append(
                 {
                     "coram": coram["coram"],
+                    "coram_index": coram_index,
                     "coram_slug": coram_slug,
                     "link_count": len(links),
                     "pdf_count": sum(1 for item in pdf_items if item.get("pdf_path")),
@@ -136,6 +138,7 @@ def fetch_bombay_cause_list(
         index_corams.append(
             {
                 "coram": coram["coram"],
+                "coram_index": coram.get("coram_index"),
                 "coram_slug": coram["coram_slug"],
                 "link_count": coram["link_count"],
                 "pdf_count": coram["pdf_count"],
@@ -217,20 +220,47 @@ def download_bombay_pdfs(
 
 
 def iter_downloaded_pdfs(payload: dict) -> list[dict]:
-    """Stage-1 index rows: one dict per downloaded PDF (for GCS + parse enqueue)."""
+    """Stage-1 index rows: one dict per downloaded PDF (for GCS + parse enqueue).
+
+    Portal sometimes repeats the same coram with overlapping links; both rows
+    land under the same ``coram_slug`` folder / ``pdf_path``. Deduplicate by
+    resolved path so mid-scrape local cleanup cannot delete a file still needed
+    by a later duplicate row.
+    """
+    from all_causelist.cloud.gcs import bmhc_coram_pdf_filename
+
     out: list[dict] = []
-    for coram in payload.get("corams") or []:
-        label = coram.get("coram") or ""
+    seen_paths: set[str] = set()
+    for pos, coram in enumerate(payload.get("corams") or [], start=1):
+        label = str(coram.get("coram") or "").strip()
+        slug = str(coram.get("coram_slug") or "").strip()
+        raw_idx = coram.get("coram_index")
+        try:
+            coram_index = int(raw_idx) if raw_idx is not None else pos
+        except (TypeError, ValueError):
+            coram_index = pos
         for item in coram.get("pdfs") or []:
             if not item.get("pdf_path"):
                 continue
+            path_key = str(Path(item["pdf_path"]).resolve())
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            source_list = str(item.get("list_type") or "Daily Main").strip()
+            gcs_name = bmhc_coram_pdf_filename(
+                label or slug or f"coram_{coram_index}",
+                source_list=source_list,
+            )
             out.append(
                 {
                     "court": "bombay",
                     "pdf_path": item["pdf_path"],
                     "source_url": item.get("url") or "",
-                    "list_type": item.get("list_type") or "Daily Main",
+                    "list_type": source_list,
                     "label": label,
+                    "coram_index": coram_index,
+                    "coram_slug": slug,
+                    "filename": gcs_name,
                 }
             )
     return out
@@ -405,7 +435,11 @@ def _select_links(links: list[dict], *, all_types: bool) -> list[dict]:
     selected = []
     for link in links:
         name = link["list_type"].casefold()
-        if name in DEFAULT_LIST_TYPES or name.startswith("daily supplementary"):
+        if (
+            name in DEFAULT_LIST_TYPES
+            or name.startswith("daily supplementary")
+            or name.startswith("weekly")
+        ):
             selected.append(link)
     return selected
 

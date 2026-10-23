@@ -52,16 +52,17 @@ COURT_SOURCE: dict[str, str] = {
     "sci": "sc_scrape",
 }
 
+# Informational only — CauseList.listType is a free string (not validated here).
 CAUSE_LIST_TYPES: frozenset[str] = frozenset(
     {
         "main",
+        "daily",
         "supplementary",
         "advance",
         "deletion",
         "miscellaneous",
         "regular",
         "weekly",
-        "other",
     }
 )
 
@@ -75,6 +76,8 @@ CAUSE_LIST_KEYS: tuple[str, ...] = (
     "hearingDate",
     "listType",
     "benchLabel",
+    "edition",
+    "benchType",
     "checksum",
     "status",
     "externalId",
@@ -141,19 +144,13 @@ _LIST_TYPE_DISPLAY: dict[str, str] = {
     "deletion": "DELETION LIST",
 }
 
-# Display / raw → Legixo CauseListType enum.
-_LIST_TYPE_ENUM: dict[str, str] = {
-    "daily": "main",
-    "daily list": "main",
-    "daily main": "main",
-    "daily causelist": "main",
-    "daily cause list": "main",
-    "advanced": "advance",
-    "advanced list": "advance",
-    "advance": "advance",
-    "advance list": "advance",
-    "regular": "regular",
-    "regular list": "regular",
+# Exact aliases → stored CauseList.listType (no substring matching).
+_LIST_TYPE_STORED: dict[str, str] = {
+    "daily": "daily",
+    "daily list": "daily",
+    "daily main": "daily",
+    "daily causelist": "daily",
+    "daily cause list": "daily",
     "supplementary": "supplementary",
     "supplementary list": "supplementary",
     "daily supplementary": "supplementary",
@@ -162,13 +159,21 @@ _LIST_TYPE_ENUM: dict[str, str] = {
     "supplimentary cause list": "supplementary",
     "supplementary cause list": "supplementary",
     "supplementary causelist": "supplementary",
-    "weekly": "weekly",
-    "weekly daily": "weekly",
-    "weekly list": "weekly",
-    "miscellaneous": "miscellaneous",
-    "miscellaneous list": "miscellaneous",
+    "advance": "advance",
+    "advance list": "advance",
+    "advanced": "advance",
+    "advanced list": "advance",
     "deletion": "deletion",
     "deletion list": "deletion",
+    "miscellaneous": "miscellaneous",
+    "miscellaneous list": "miscellaneous",
+    "regular": "regular",
+    "regular list": "regular",
+    "weekly": "weekly",
+    "weekly list": "weekly",
+    "weekly daily": "weekly",
+    # Legacy / default token when label missing.
+    "main": "main",
 }
 
 _SPLIT_RE = re.compile(r"\s*\|\s*")
@@ -274,26 +279,26 @@ def normalize_list_type(raw: str | None, *, default: str = "DAILY LIST") -> str:
 
 
 def normalize_list_type_enum(raw: str | None, *, default: str = "main") -> str:
-    """Map display / raw list label to Legixo CauseListType enum."""
+    """Produce the **stored** CauseList.listType string (free string).
+
+    Exact alias match only — no substring loop (so ``daily supplementary``
+    stays ``supplementary``, not ``daily``). Unknown labels → uppercased text.
+    Missing → ``main``.
+    """
     if not raw:
         return default
     text = re.sub(r"\s+", " ", str(raw).replace("\xa0", " ")).strip()
     if not text:
         return default
     folded = text.casefold()
-    if folded in CAUSE_LIST_TYPES:
-        return folded
-    if folded in _LIST_TYPE_ENUM:
-        return _LIST_TYPE_ENUM[folded]
-    display = normalize_list_type(text).casefold()
-    if display in _LIST_TYPE_ENUM:
-        return _LIST_TYPE_ENUM[display]
-    for needle, enum_val in _LIST_TYPE_ENUM.items():
-        if folded.startswith(needle) or needle in folded:
-            return enum_val
-        if display.startswith(needle) or needle in display:
-            return enum_val
-    return "other"
+    if folded in _LIST_TYPE_STORED:
+        return _LIST_TYPE_STORED[folded]
+    return text.upper()
+
+
+def _identity_seg(value: str | None) -> str:
+    """externalId / path segment: strip; never allow ``:``."""
+    return (value or "").strip().replace(":", "_")
 
 
 def split_case_numbers(raw: str | list[str] | None) -> list[str]:
@@ -496,7 +501,10 @@ def sha256_hex(material: Any) -> str:
 
 
 def compute_checksum(raw: bytes | str | Any) -> str:
-    """SHA-256 of raw PDF/HTML bytes, or of stable JSON for structured units."""
+    """SHA-256 of bytes/string, or of stable JSON for structured values.
+
+    Prefer :func:`compute_parsed_unit_checksum` for CauseList.checksum (parsed fields).
+    """
     if isinstance(raw, (bytes, bytearray)):
         return hashlib.sha256(raw).hexdigest()
     if isinstance(raw, str):
@@ -504,13 +512,93 @@ def compute_checksum(raw: bytes | str | Any) -> str:
     return sha256_hex(raw)
 
 
+# Volatile / download-only keys — not part of parsed listing content.
+_PARSED_PAYLOAD_SKIP = frozenset(
+    {"source_url", "gcs_uri", "rawRef", "pdf_path", "local_path"}
+)
+
+
+def parsed_fields_checksum_material(item: dict[str, Any]) -> dict[str, Any]:
+    """One CauseListItem's parse-derived fields for unit checksum (stable keys)."""
+    payload_in = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    payload = {
+        k: v
+        for k, v in payload_in.items()
+        if k not in _PARSED_PAYLOAD_SKIP and v is not None
+    }
+    return {
+        "hearingDate": item.get("hearingDate"),
+        "fingerprint": item.get("fingerprint"),
+        "identities": item.get("identities") or {},
+        "cnr": item.get("cnr"),
+        "listingNo": item.get("listingNo"),
+        "listingSection": item.get("listingSection"),
+        "purpose": item.get("purpose"),
+        "courtNo": item.get("courtNo"),
+        "bench": item.get("bench"),
+        "judges": item.get("judges") or [],
+        "party": item.get("party"),
+        "payload": payload,
+    }
+
+
+def compute_parsed_unit_checksum(
+    *,
+    court_key: str,
+    hearing_date: str,
+    list_type: str,
+    bench_label: str,
+    items: list[dict[str, Any]],
+    external_id: str = "",
+    edition: str = "",
+    bench_type: str = "",
+) -> str:
+    """CauseList.checksum = SHA of **all parsed fields** for one board unit.
+
+    After PDF/HTML parse: hash every item's listing fields (identities, party,
+    judges, purpose, payload content, …) plus unit identity. Not raw file bytes.
+    """
+    ck = resolve_court_key(court_key)
+    lt = normalize_list_type_enum(list_type)
+    materials = [
+        parsed_fields_checksum_material(item)
+        for item in items
+        if isinstance(item, dict)
+    ]
+    materials.sort(
+        key=lambda m: (
+            m.get("listingNo") is None,
+            m.get("listingNo") if isinstance(m.get("listingNo"), int) else 10**9,
+            str(m.get("fingerprint") or ""),
+            stable_serialize(m),
+        )
+    )
+    return sha256_hex(
+        {
+            "courtKey": ck,
+            "hearingDate": hearing_date,
+            "listType": lt,
+            "benchLabel": (bench_label or "").strip(),
+            "edition": _identity_seg(edition),
+            "benchType": _identity_seg(bench_type),
+            "externalId": external_id or "",
+            "items": materials,
+        }
+    )
+
+
 def make_external_id(
     court_key: str,
     hearing_date: str,
     list_type: str,
     bench_label: str = "",
+    edition: str = "",
+    bench_type: str = "",
 ) -> str:
-    """Stable CauseList.externalId: ``courtKey:YYYY-MM-DD:listType:benchLabel``."""
+    """Stable CauseList.externalId.
+
+    ``courtKey:YYYY-MM-DD:listType:benchLabel:edition:benchType``
+    """
     ck = resolve_court_key(court_key)
     date = str(hearing_date or "").strip()
     if hasattr(hearing_date, "strftime"):
@@ -518,8 +606,10 @@ def make_external_id(
     elif len(date) >= 10 and date[4] == "-" and date[7] == "-":
         date = date[:10]
     lt = normalize_list_type_enum(list_type)
-    bench = (bench_label or "").strip()
-    return f"{ck}:{date}:{lt}:{bench}"
+    bench = _identity_seg(bench_label)
+    ed = _identity_seg(edition)
+    bt = _identity_seg(bench_type)
+    return f"{ck}:{date}:{lt}:{bench}:{ed}:{bt}"
 
 
 def compute_fingerprint(
@@ -533,11 +623,13 @@ def compute_fingerprint(
     bench: str | None,
     judges: list[str],
     list_type: str | None = None,
+    edition: str | None = None,
+    bench_type: str | None = None,
 ) -> str:
     """Item fingerprint per HC/SC contract (purpose in, party out).
 
-    ``list_type`` is included so the same case on main vs supplementary
-    (or any other list) gets a distinct fingerprint for notify gating.
+    Stored ``listType``, ``edition``, and ``benchType`` are included so the
+    same case on a different board (e.g. division bench / edition 2) is distinct.
     """
     return sha256_hex(
         [
@@ -553,6 +645,8 @@ def compute_fingerprint(
             bench,
             judges,
             normalize_list_type_enum(list_type),
+            _identity_seg(edition),
+            _identity_seg(bench_type),
         ]
     )
 
@@ -617,6 +711,8 @@ def make_cause_list_item(
     list_type_display: str | None = None,
     source_url: str | None = None,
     payload_extra: dict[str, Any] | None = None,
+    edition: str | None = None,
+    bench_type: str | None = None,
 ) -> dict[str, Any]:
     """Build one CauseListItem-shaped dict (no documentId)."""
     numbers = (
@@ -631,7 +727,9 @@ def make_cause_list_item(
     bench_label = (bench or "").strip() or None
     party_text = (party or "").strip() or None
     listing = parse_listing_no(listing_no)
-    list_type_enum = normalize_list_type_enum(list_type)
+    list_type_stored = normalize_list_type_enum(list_type)
+    ed = _identity_seg(edition)
+    bt = _identity_seg(bench_type)
     identities = parse_case_identities(
         numbers,
         cnr=cnr,
@@ -647,7 +745,9 @@ def make_cause_list_item(
         court_no=court,
         bench=bench_label,
         judges=judge_list,
-        list_type=list_type_enum,
+        list_type=list_type_stored,
+        edition=ed,
+        bench_type=bt,
     )
     payload: dict[str, Any] = {}
     if court_name_value:
@@ -706,34 +806,45 @@ def make_cause_list(
     status: str | None = None,
     raw_ref: str | None = None,
     content_type: str | None = None,
+    edition: str = "",
+    bench_type: str = "",
 ) -> dict[str, Any]:
     """Build one CauseList-shaped parent (items nested for file output)."""
     ck = resolve_court_key(court_key)
-    enum_type = normalize_list_type_enum(list_type)
+    stored_type = normalize_list_type_enum(list_type)
+    ed = _identity_seg(edition)
+    bt = _identity_seg(bench_type)
+    bench = (bench_label or "").strip()
     item_list = list(items)
     if status is None:
         status = "ok" if item_list else "empty"
     if status not in CAUSE_LIST_STATUSES:
         raise ValueError(f"invalid status: {status}")
+    eid = external_id or make_external_id(
+        ck, hearing_date, stored_type, bench, ed, bt
+    )
     doc: dict[str, Any] = {
         "source": COURT_SOURCE[ck],
         "courtLevel": COURT_LEVEL[ck],
         "courtKey": ck,
         "hearingDate": hearing_date,
-        "listType": enum_type,
-        "benchLabel": (bench_label or "").strip(),
-        "checksum": checksum or compute_checksum(
-            {
-                "courtKey": ck,
-                "hearingDate": hearing_date,
-                "listType": enum_type,
-                "benchLabel": (bench_label or "").strip(),
-                "externalId": external_id or "",
-                "fingerprints": [i.get("fingerprint") for i in item_list],
-            }
+        "listType": stored_type,
+        "benchLabel": bench,
+        "edition": ed,
+        "benchType": bt,
+        "checksum": checksum
+        or compute_parsed_unit_checksum(
+            court_key=ck,
+            hearing_date=hearing_date,
+            list_type=stored_type,
+            bench_label=bench,
+            items=item_list,
+            external_id=eid,
+            edition=ed,
+            bench_type=bt,
         ),
         "status": status,
-        "externalId": external_id or "",
+        "externalId": eid,
         "items": item_list,
     }
     if raw_ref:
@@ -752,6 +863,8 @@ def flat_case_to_item(
     list_type_display: str,
     list_type: str | None = None,
     source_url: str | None = None,
+    edition: str = "",
+    bench_type: str = "",
 ) -> dict[str, Any]:
     """Convert a scraper ``make_case`` row into a CauseListItem."""
     reserved = set(COMMON_CASE_KEYS) | {
@@ -802,6 +915,8 @@ def flat_case_to_item(
         or row.get("pdf_url")
         or row.get("_source_url"),
         payload_extra=extra or None,
+        edition=edition,
+        bench_type=bench_type,
     )
 
 
@@ -813,8 +928,8 @@ def group_flat_cases_to_documents(
 ) -> list[dict[str, Any]]:
     """Group flat scraper rows into CauseList documents with items."""
     ck = resolve_court_key(court_key)
-    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    meta: dict[tuple[str, str, str], dict[str, Any]] = {}
+    groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
+    meta: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
 
     for row in cases:
         if not isinstance(row, dict):
@@ -826,8 +941,11 @@ def group_flat_cases_to_documents(
             or row.get("list_type")
             or "DAILY LIST"
         )
+        # Display map OK for human label; stored listType = exact-alias enum only.
         display = normalize_list_type(str(display))
-        list_type = normalize_list_type_enum(display)
+        list_type = normalize_list_type_enum(
+            group.get("listType") or display
+        )
         bench = (
             group.get("benchLabel")
             or row.get("_benchLabel")
@@ -837,6 +955,10 @@ def group_flat_cases_to_documents(
             or ""
         )
         bench = str(bench).strip()
+        edition = _identity_seg(group.get("edition") or row.get("edition") or "")
+        bench_type = _identity_seg(
+            group.get("benchType") or row.get("benchType") or ""
+        )
         source_url = (
             group.get("source_url")
             or row.get("_source_url")
@@ -844,19 +966,21 @@ def group_flat_cases_to_documents(
             or row.get("pdf_url")
             or ""
         )
-        # Contract identity — never use download URL / GCS URI as externalId.
-        external_id = make_external_id(ck, hearing_date, list_type, bench)
-        key = (list_type, bench, external_id)
+        external_id = make_external_id(
+            ck, hearing_date, list_type, bench, edition, bench_type
+        )
+        key = (list_type, bench, edition, bench_type, external_id)
         groups.setdefault(key, []).append(row)
         meta[key] = {
             "list_type_display": display,
             "listType": list_type,
             "benchLabel": bench,
+            "edition": edition,
+            "benchType": bench_type,
             "externalId": external_id,
             "source_url": source_url or None,
             "rawRef": group.get("rawRef") or row.get("gcs_uri") or row.get("rawRef"),
             "contentType": group.get("contentType") or row.get("contentType"),
-            "checksum_raw": group.get("checksum_raw"),
         }
 
     documents: list[dict[str, Any]] = []
@@ -870,12 +994,11 @@ def group_flat_cases_to_documents(
                 list_type_display=info["list_type_display"],
                 list_type=info["listType"],
                 source_url=info["source_url"],
+                edition=info["edition"],
+                bench_type=info["benchType"],
             )
             for row in rows
         ]
-        checksum = None
-        if info.get("checksum_raw") is not None:
-            checksum = compute_checksum(info["checksum_raw"])
         documents.append(
             make_cause_list(
                 court_key=ck,
@@ -884,9 +1007,11 @@ def group_flat_cases_to_documents(
                 bench_label=info["benchLabel"],
                 items=items,
                 external_id=info["externalId"],
-                checksum=checksum,
+                checksum=None,
                 raw_ref=info.get("rawRef"),
                 content_type=info.get("contentType"),
+                edition=info["edition"],
+                bench_type=info["benchType"],
             )
         )
     return documents
